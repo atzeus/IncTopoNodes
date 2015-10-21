@@ -1,14 +1,14 @@
 
 {-# Language MagicHash #-} 
-module IncTopoSort(TopoNode, Level, newNode, addEdge, removeEdge, getAliveParents, getLevel, isBefore,
+module IncTopoSort(Node, SomeNode, Level, newNode, addEdge, removeEdge, getAliveParents, getLevel, isBefore,
                    PrioQueue, emptyPqueue, insertNode, dequeue) where
 
 import Data.Int
-import Data.Graph
+import Data.Graph hiding (Node) 
 import Data.IORef
 import Data.List
 import Data.Maybe
-import Data.Tree
+import Data.Tree hiding (Node)
 import System.Mem.Weak
 import GHC.Prim
 import Test.QuickCheck
@@ -23,30 +23,35 @@ data TopoInfo = TopoNode {
    level   :: {-# UNPACK #-} !Level }
   | BlackHole
 
-newtype PrioQueue = PQ (IntMap TopoNode)
+newtype PrioQueue = PQ (IntMap SomeNode)
 
 type Level = Int
 
-newtype TopoNode = TN (IORef TopoInfo) deriving Eq
+newtype SomeNode = SN (IORef TopoInfo) deriving Eq
+newtype Node a = Node (IORef TopoInfo) deriving Eq
 
-newtype TIORef a = TR (IORef TopoInfo) deriving Eq
+toSomeNode :: Node a -> SomeNode
+toSomeNode (Node a) = SN a
 
-newNode :: a -> IO (TopoNode, TIORef a)
+newNode :: a -> IO (Node a)
 newNode a = do r <- newIORef (TopoNode [] (unsafeCoerce# a) minBound)
-               return (TN r, TR r)
+               return (Node r)
 
-readTIORef :: TIORef a -> IO a
-readTIORef (TR r) = unsafeCoerce# . info <$> readIORef r
+readNode :: Node a -> IO a
+readNode (Node r) = unsafeCoerce# . info <$> readIORef r
 
-writeTIORef :: TIORef a -> a -> IO ()
-writeTIORef (TR r) a = 
+writeNode :: Node a -> a -> IO ()
+writeNode (Node r) a = 
   do v <- readIORef r
      writeIORef r (v {info = unsafeCoerce# a}) 
 
-addEdge :: TopoNode -> TopoNode -> IO Bool
-addEdge from@(TN fr) (TN to) = 
+addEdge :: Node a -> Node b -> IO Bool
+addEdge from to = addEdgeS (toSomeNode from) (toSomeNode to)
+
+addEdgeS :: SomeNode -> SomeNode -> IO Bool
+addEdgeS from@(SN fr) (SN to) = 
   do toInfo  <- readIORef to
-     notLoop <- ensureLevel (level toInfo + 1) from
+     notLoop <- ensureLevelS (level toInfo + 1) from
      if notLoop 
      then do wTo  <- mkWeakIORef to (return ())  
              fref <- mkWeakIORef fr (removeEdgeWeak from wTo)
@@ -54,8 +59,12 @@ addEdge from@(TN fr) (TN to) =
      else return ()
      return notLoop
 
-ensureLevel :: Level -> TopoNode -> IO Bool
-ensureLevel minLev n@(TN node) = 
+
+ensureLevel :: Level -> Node a -> IO Bool
+ensureLevel minLev n = ensureLevelS minLev (toSomeNode n)
+
+ensureLevelS :: Level -> SomeNode -> IO Bool
+ensureLevelS minLev n@(SN node) = 
   do ninfo <- readIORef node
      case ninfo of
       BlackHole -> return False
@@ -63,20 +72,24 @@ ensureLevel minLev n@(TN node) =
       ninfo -> 
         do writeIORef node BlackHole
            pr <- catMaybes <$> mapM deRefWeak (parents ninfo)
-           res <- mapM (ensureLevel (minLev + 1) . TN)  pr
+           res <- mapM (ensureLevelS (minLev + 1) . SN)  pr
            writeIORef node (ninfo {level = minLev})
            return (all id res)
 
-removeEdgeWeak :: TopoNode -> Weak (IORef TopoInfo) -> IO ()
+
+removeEdgeWeak :: SomeNode -> Weak (IORef TopoInfo) -> IO ()
 removeEdgeWeak from wTo = 
  do x <- deRefWeak wTo 
     case x of
-      Just to -> removeEdge from (TN to) 
+      Just to -> removeEdgeS from (SN to) 
       Nothing -> return ()
-      
 
-removeEdge :: TopoNode -> TopoNode -> IO ()
-removeEdge (TN from) (TN to) = 
+removeEdge :: Node a -> Node b -> IO ()
+removeEdge from to = removeEdgeS (toSomeNode from) (toSomeNode to)
+
+
+removeEdgeS :: SomeNode -> SomeNode -> IO ()
+removeEdgeS (SN from) (SN to) = 
   do toInfo <- readIORef to
      parents' <- loop (parents toInfo) 
      writeIORef to (toInfo {parents = parents'} ) where
@@ -87,35 +100,38 @@ removeEdge (TN from) (TN to) =
            Just q  -> if q == to then loop t else (x :) <$> loop t
            Nothing -> loop t
 
-getAliveParents :: TopoNode -> IO [TopoNode]
-getAliveParents (TN n) = 
+getAliveParents :: Node a -> IO [SomeNode]
+getAliveParents (Node n) = 
      do pr <- parents <$> readIORef n
-        map TN . catMaybes <$> mapM deRefWeak pr
+        map SN . catMaybes <$> mapM deRefWeak pr
 
-getLevel :: TopoNode -> IO Level
-getLevel (TN n) = level <$> readIORef n
+getLevel :: Node a -> IO Level
+getLevel (Node n) = level <$> readIORef n
 
-isBefore :: TopoNode -> TopoNode -> IO Bool
+getLevelS :: SomeNode -> IO Level
+getLevelS (SN n) = level <$> readIORef n
+
+isBefore :: Node a -> Node b -> IO Bool
 isBefore l r = (<) <$> getLevel l <*> getLevel r
 
 
 
-newDullNode :: IO (TopoNode)
-newDullNode = fst <$> newNode () 
+newDullNode :: IO SomeNode
+newDullNode = toSomeNode <$> newNode () 
 
 emptyPqueue :: PrioQueue
 emptyPqueue = PQ empty
 
-insertNode :: TopoNode -> PrioQueue ->  IO PrioQueue
-insertNode t (PQ pq) = do lev <- getLevel t 
+insertNode :: SomeNode -> PrioQueue ->  IO PrioQueue
+insertNode t (PQ pq) = do lev <- getLevelS t 
                           return (PQ $ IM.insert lev t pq)
 
-dequeue :: PrioQueue -> IO (Maybe (TopoNode, PrioQueue))
+dequeue :: PrioQueue -> IO (Maybe (SomeNode, PrioQueue))
 dequeue (PQ pq)
   | IM.null pq = return Nothing
   | otherwise  = 
      let ((lev,node),pq') = deleteFindMin pq
-     in do lev' <- getLevel node
+     in do lev' <- getLevelS node
            if lev == lev' 
            then return (Just (node, PQ pq'))
            else dequeue (PQ $ IM.insert lev' node pq')
@@ -160,8 +176,8 @@ filterLoopEdges (AdjList nr edges) = AdjList nr $ loop edges [] where
 buildGraph :: AdjList -> IO [Level]
 buildGraph (AdjList nr edges) = 
        do nodes <- sequence [newDullNode | i <- [1..nr]]
-          mapM (\(from,to) -> addEdge (nodes !! (from -1)) (nodes !! (to - 1))) edges
-          levels <- mapM getLevel nodes
+          mapM (\(from,to) -> addEdgeS (nodes !! (from -1)) (nodes !! (to - 1))) edges
+          levels <- mapM getLevelS nodes
           return (map (+ minBound) levels) -- get rid of these low values
 
 

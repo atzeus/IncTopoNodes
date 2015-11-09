@@ -1,7 +1,7 @@
 
-{-# Language MagicHash #-} 
-module IncTopoSort(Node, SomeNode, Level, newNode, addEdge, removeEdge, getAliveParents, getLevel, isBefore,
-                   PrioQueue, emptyPqueue, insertNode, dequeue) where
+{-# Language MagicHash,Rank2Types,ImpredicativeTypes, GADTs, KindSignatures #-} 
+module IncTopoSort(Node,  ExNode(..), Level,  newNode, addEdge, removeEdge, getAliveParents, getLevel, isBefore, eqConv, readNode, writeNode,
+                   PrioQueue, emptyPqueue, isInQueue, insertNode, dequeue) where
 
 import Data.Int
 import Data.Graph hiding (Node) 
@@ -13,6 +13,7 @@ import System.Mem.Weak
 import GHC.Prim
 import Test.QuickCheck
 import Test.QuickCheck.Monadic
+import Unsafe.Coerce
 import Control.Monad.Trans
 import Data.IntMap.Strict hiding (map,null,filter,insert)
 import qualified Data.IntMap.Strict as IM
@@ -23,14 +24,28 @@ data TopoInfo = TopoNode {
    level   :: {-# UNPACK #-} !Level }
   | BlackHole
 
-newtype PrioQueue = PQ (IntMap SomeNode)
+newtype PrioQueue f = PQ (IORef (IntMap [ExNode f])) deriving Eq
 
 type Level = Int
 
-newtype SomeNode = SN (IORef TopoInfo) deriving Eq
+data ExNode f where
+  ExN :: Node (f a) -> ExNode f
+
+newtype SomeNode (f :: * -> *) = SN (IORef TopoInfo) deriving Eq
 newtype Node a = Node (IORef TopoInfo) deriving Eq
 
-toSomeNode :: Node a -> SomeNode
+toExNode :: SomeNode f -> ExNode f
+toExNode (SN n) = ExN (Node n)
+
+
+eqConv :: Node (g a) -> Node (g b) -> Maybe (f a -> f b)
+eqConv (Node x) (Node y) | x == y    = Just unsafeCoerce
+                         | otherwise = Nothing
+
+exNodeEq :: ExNode f -> ExNode f -> Bool
+exNodeEq (ExN (Node x)) (ExN (Node y)) = x == y
+
+toSomeNode :: Node (f a) -> SomeNode f
 toSomeNode (Node a) = SN a
 
 newNode :: a -> IO (Node a)
@@ -45,10 +60,10 @@ writeNode (Node r) a =
   do v <- readIORef r
      writeIORef r (v {info = unsafeCoerce# a}) 
 
-addEdge :: Node a -> Node b -> IO Bool
+addEdge :: Node (f a) -> Node (f b) -> IO Bool
 addEdge from to = addEdgeS (toSomeNode from) (toSomeNode to)
 
-addEdgeS :: SomeNode -> SomeNode -> IO Bool
+addEdgeS :: SomeNode f -> SomeNode f -> IO Bool
 addEdgeS from@(SN fr) (SN to) = 
   do toInfo  <- readIORef to
      notLoop <- ensureLevelS (level toInfo + 1) from
@@ -60,10 +75,10 @@ addEdgeS from@(SN fr) (SN to) =
      return notLoop
 
 
-ensureLevel :: Level -> Node a -> IO Bool
+ensureLevel :: Level -> Node (f a) -> IO Bool
 ensureLevel minLev n = ensureLevelS minLev (toSomeNode n)
 
-ensureLevelS :: Level -> SomeNode -> IO Bool
+ensureLevelS :: Level -> SomeNode f -> IO Bool
 ensureLevelS minLev n@(SN node) = 
   do ninfo <- readIORef node
      case ninfo of
@@ -77,18 +92,18 @@ ensureLevelS minLev n@(SN node) =
            return (all id res)
 
 
-removeEdgeWeak :: SomeNode -> Weak (IORef TopoInfo) -> IO ()
+removeEdgeWeak :: SomeNode f -> Weak (IORef TopoInfo) -> IO ()
 removeEdgeWeak from wTo = 
  do x <- deRefWeak wTo 
     case x of
       Just to -> removeEdgeS from (SN to) 
       Nothing -> return ()
 
-removeEdge :: Node a -> Node b -> IO ()
+removeEdge :: Node (f a) -> Node (f b) -> IO ()
 removeEdge from to = removeEdgeS (toSomeNode from) (toSomeNode to)
 
 
-removeEdgeS :: SomeNode -> SomeNode -> IO ()
+removeEdgeS :: SomeNode f -> SomeNode f -> IO ()
 removeEdgeS (SN from) (SN to) = 
   do toInfo <- readIORef to
      parents' <- loop (parents toInfo) 
@@ -100,41 +115,62 @@ removeEdgeS (SN from) (SN to) =
            Just q  -> if q == to then loop t else (x :) <$> loop t
            Nothing -> loop t
 
-getAliveParents :: Node a -> IO [SomeNode]
+getAliveParents :: Node (f a) -> IO [ExNode f]
 getAliveParents (Node n) = 
      do pr <- parents <$> readIORef n
-        map SN . catMaybes <$> mapM deRefWeak pr
+        map (toExNode . SN) . catMaybes <$> mapM deRefWeak pr
 
 getLevel :: Node a -> IO Level
 getLevel (Node n) = level <$> readIORef n
 
-getLevelS :: SomeNode -> IO Level
+getLevelEx :: ExNode f -> IO Level
+getLevelEx (ExN n) = getLevel n
+
+getLevelS :: SomeNode f -> IO Level
 getLevelS (SN n) = level <$> readIORef n
 
 isBefore :: Node a -> Node b -> IO Bool
 isBefore l r = (<) <$> getLevel l <*> getLevel r
 
+data Id x = Id x
 
+type NNode = SomeNode Id
 
-newDullNode :: IO SomeNode
-newDullNode = toSomeNode <$> newNode () 
+newDullNode :: IO NNode
+newDullNode = toSomeNode <$> newNode (Id ()) 
 
-emptyPqueue :: PrioQueue
-emptyPqueue = PQ empty
+emptyPqueue :: IO (PrioQueue f)
+emptyPqueue = PQ <$> newIORef empty
 
-insertNode :: SomeNode -> PrioQueue ->  IO PrioQueue
-insertNode t (PQ pq) = do lev <- getLevelS t 
-                          return (PQ $ IM.insert lev t pq)
+isInQueue :: ExNode f -> PrioQueue f -> IO Bool
+isInQueue (ExN n) (PQ pqr) = 
+   do pq <- readIORef pqr
+      lev <- getLevel n
+      return $ isJust $ 
+          do l <- IM.lookup lev pq 
+             find (exNodeEq (ExN n)) l
 
-dequeue :: PrioQueue -> IO (Maybe (SomeNode, PrioQueue))
-dequeue (PQ pq)
-  | IM.null pq = return Nothing
-  | otherwise  = 
-     let ((lev,node),pq') = deleteFindMin pq
-     in do lev' <- getLevelS node
-           if lev == lev' 
-           then return (Just (node, PQ pq'))
-           else dequeue (PQ $ IM.insert lev' node pq')
+      
+ 
+
+insertNode :: ExNode f -> PrioQueue f ->  IO ()
+insertNode ex@(ExN n) (PQ pqr) = 
+   do pq <- readIORef pqr
+      lev <- getLevel n
+      writeIORef pqr ( IM.insertWith (++) lev [ex] pq)
+
+dequeue :: PrioQueue f -> IO (Maybe (Level, ExNode f))
+dequeue (PQ pqr) =
+  do pq <- readIORef pqr
+     if IM.null pq 
+     then return Nothing
+     else let ((lev,node : t') ,pq') = deleteFindMin pq
+          in do lev' <- getLevelEx node
+                if lev == lev' 
+                then do writeIORef pqr (IM.insert lev t' pq')
+                        return (Just (lev, node))
+                else do writeIORef pqr ( IM.insertWith (++) lev' [node] pq')
+                        dequeue (PQ pqr)
                                   
 
 

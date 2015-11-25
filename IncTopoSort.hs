@@ -1,6 +1,6 @@
 
 {-# Language MagicHash,Rank2Types,ImpredicativeTypes, GADTs, KindSignatures #-} 
-module IncTopoSort(Node,  ExNode(..), Level,  newNode, addEdge, removeEdge, getAliveParents, getLevel, isBefore, eqConv, readNode, writeNode,
+module IncTopoSort(Node,  ExNode(..), Level,  newNode, addEdge, removeEdge, getAliveParents, removeParents, getLevel, isBefore, eqConv, readNode, writeNode,
                    PrioQueue, emptyPqueue, isInQueue, insertNode, dequeue) where
 
 import Data.Int
@@ -17,6 +17,7 @@ import Unsafe.Coerce
 import Control.Monad.Trans
 import Data.IntMap.Strict hiding (map,null,filter,insert)
 import qualified Data.IntMap.Strict as IM
+
 
 data TopoInfo = TopoNode {
    parents :: ![Weak (IORef TopoInfo)],
@@ -102,6 +103,13 @@ removeEdgeWeak from wTo =
 removeEdge :: Node (f a) -> Node (f b) -> IO ()
 removeEdge from to = removeEdgeS (toSomeNode from) (toSomeNode to)
 
+removeParents :: Node (f a) -> IO ()
+removeParents from = removeParentsS (toSomeNode from)
+
+removeParentsS :: SomeNode f -> IO ()
+removeParentsS (SN to) =
+  do info <- readIORef to
+     writeIORef to (info { parents = [] })
 
 removeEdgeS :: SomeNode f -> SomeNode f -> IO ()
 removeEdgeS (SN from) (SN to) = 
@@ -167,7 +175,9 @@ dequeue (PQ pqr) =
      else let ((lev,node : t') ,pq') = deleteFindMin pq
           in do lev' <- getLevelEx node
                 if lev == lev' 
-                then do writeIORef pqr (IM.insert lev t' pq')
+                then do case t' of
+                          [] -> writeIORef pqr pq'
+                          _  -> writeIORef pqr (IM.insert lev t' pq')
                         return (Just (lev, node))
                 else do writeIORef pqr ( IM.insertWith (++) lev' [node] pq')
                         dequeue (PQ pqr)

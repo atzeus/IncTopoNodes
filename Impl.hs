@@ -1,4 +1,4 @@
-{-# Language GADTs,GeneralizedNewtypeDeriving, ViewPatterns, TupleSections #-} 
+{-# Language ScopedTypeVariables, GADTs,GeneralizedNewtypeDeriving, ViewPatterns, TupleSections #-} 
 
 module Impl where
 
@@ -49,6 +49,35 @@ data EState a = EState {
 data E a = Never
          | E !Env !(Node (EState a))
 
+
+data Mf a where
+  LiftIO  :: IO a -> Mf a
+  Step    :: a -> E a -> Mf (B a)
+  ValueB  :: B a -> Mf a
+  IsNow   :: E a -> Mf (Maybe a)
+  Fix    :: (a -> M a) -> Mf a
+
+data M a where
+  M      :: Mf a -> M a
+  Bind   :: M a -> (a -> M b) -> M b
+  Return :: a -> M a
+
+data ViewM a where
+  Pure :: a -> ViewM a
+  Act  :: Mf a -> (a -> M b) -> ViewM b
+
+instance Monad M where
+  return = Return
+  (>>=)  = Bind
+
+instance MonadFix M where
+  mfix f = M $ Fix f
+
+
+step i b = M $ Step i b
+valueB b = M $ ValueB b
+isNow e = M $ IsNow e
+unsafeMomentIO i = M $ LiftIO i
 
 
 readE :: Node (EState a) -> IO (Maybe a)
@@ -221,45 +250,14 @@ makeBehaviorOf i ev@(E e m) =
 
 
 
-data Mf a where
-  LiftIO  :: IO a -> Mf a
-  Step    :: a -> E a -> Mf (B a)
-  ValueB  :: B a -> Mf a
-  IsNow   :: E a -> Mf (Maybe a)
-
-data M a where
-  M      :: Mf a -> M a
-  MFix   :: (a -> M a) -> M a
-  Bind   :: M a -> (a -> M b) -> M b
-  Return :: a -> M a
-
-data ViewM a where
-  Pure :: a -> ViewM a
-  Act  :: Mf a -> (a -> M b) -> ViewM b
-  Fix :: (a -> M a) -> ViewM a
-
-instance Monad M where
-  return = Return
-  (>>=)  = Bind
-
-instance MonadFix M where
-  mfix = MFix
 
 
-step i b = M $ Step i b
-valueB b = M $ ValueB b
-isNow e = M $ IsNow e
-unsafeMomentIO i = M $ LiftIO i
-
-viewM :: M a -> ViewM a
+viewM :: forall a. M a -> ViewM a
 viewM (Bind (Bind m f) g) = viewM $ Bind m (\x -> Bind (f x) g) 
 viewM (Bind (Return x) f) = viewM $ f x
 viewM (Bind (M x) f)      = Act x f
 viewM (M m)               = Act m Return 
---viewM (Bind (MFix f) g)   = Fix $ \x -> Bind (f x) g
 viewM (Return x)          = Pure x
-viewM (MFix f)            = Fix f
-
 
 observeE :: E (M a) -> E a
 observeE Never   = Never
@@ -276,6 +274,7 @@ observeE (E e n) = res where
   loop (viewM -> Pure x)  = emit x res
   loop a@(viewM -> Act m f) =
      case m of
+       LiftIO m -> m >>= loop . f
        ValueB b -> readB e b >>= loop . f
        Step i ev -> makeBehaviorOf i ev >>= loop . f
        IsNow (E e' m) 
@@ -291,13 +290,13 @@ observeE (E e n) = res where
                                    return x
                        setAction node (loop a)
                        insertNodeNub (queue e) (ExN node)
-  loop (viewM -> Fix f) = 
-     do r <- newIORef undefined
-        let v = unsafePerformIO $ readIORef r
-        let a' = do x <- f v
-                    unsafeMomentIO $ writeIORef r x
-                    return x
-        loop a'
+       Fix fx -> 
+         do r <- newIORef undefined
+            let v = unsafePerformIO $ readIORef r
+            let a' = do x <- fx v
+                        unsafeMomentIO $ writeIORef r x
+                        return x
+            loop (a' >>= f)
 
    
 
@@ -315,12 +314,13 @@ doIteration e =
                        e <- readNode n
                        action e
                        visitNodes
-      Nothing -> cleanUp
- cleanUp = 
+      Nothing -> return ()
+cleanUp :: Env -> IO ()
+cleanUp e = 
     do s <- readIORef (envState e)
        mapM_ (\(Ex x) -> seq x (return ())) (seqs s)
        mapM_ cleanE (clean s)
-       writeIORef (envState e) (s {curLevel = 0, seqs = [], clean = []})
+       writeIORef (envState e) (s {curLevel = 0, seqs = [], clean = []}) where
 
  cleanE (ExF (E _ n))  =
      do es <- readNode n                  
@@ -330,6 +330,15 @@ doIteration e =
         let b' = catMaybes $ zipWith (\x y -> x <$ y) (behav es) bm
         writeNode n (es { behav = b', curEmit = Nothing})
         
+scanE :: (b -> a -> b) -> b -> E a -> M (B b)
+scanE f i e = 
+  mfix $ \b ->
+    let em = (\v -> do i <- valueB b; pure (f i v)) <$> e
+    in step i (observeE em)
+
+
+test = interpret (scanE (+) 0) [if x `mod` 1 == 0 then Just 1 else Nothing | x <- [0..50]]
+
 interpret :: (E a -> M (B b)) -> [Maybe a] -> IO [b]     
 interpret f (h : t) =
   do env <- Env <$> newUnique <*> emptyPqueue <*> newIORef (ES [] [] 0 0) 
@@ -345,9 +354,10 @@ interpret f (h : t) =
   loop env i r [] = (\x -> [x]) <$> readIORef r
   loop env i r (h : t) = 
       do x <- readIORef r
+         cleanUp env
          maybe (return ()) (`emit` i) h
          doIteration env
-         loop env i r t
+         (x :) <$> loop env i r t
      
 
 

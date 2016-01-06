@@ -1,7 +1,7 @@
 
 {-# Language MagicHash,Rank2Types,ImpredicativeTypes, GADTs, KindSignatures #-} 
-module IncTopoSort(Node,  ExNode(..), Level,  newNode, addEdge, removeEdge, getAliveParents, removeParents, getLevel, isBefore, eqConv, readNode, writeNode,
-                   PrioQueue, emptyPqueue, isInQueue, insertNode, dequeue) where
+module IncTopoSort(Node,  ExNode(..), Level,  newNode, addEdge, removeEdge, getAliveParents, ensureLevel, removeParents, getLevel, isBefore, eqConv, readNode, writeNode, scheduleParents,
+                   PrioQueue, emptyPqueue, isInQueue, insertNode, dequeue, insertNodeNub) where
 
 import Data.Int
 import Data.Graph hiding (Node) 
@@ -158,8 +158,20 @@ isInQueue (ExN n) (PQ pqr) =
           do l <- IM.lookup lev pq 
              find (exNodeEq (ExN n)) l
 
+scheduleParents ::  PrioQueue f -> Node (f a) -> IO ()
+scheduleParents p n = 
+ do ps <- getAliveParents n
+    mapM_ (insertNodeNub p) ps
+
       
  
+insertNodeNub :: PrioQueue f -> ExNode f ->  IO ()
+insertNodeNub p n =
+  do x <- isInQueue n p
+     if x 
+      then return ()
+      else insertNode n p
+      
 
 insertNode :: ExNode f -> PrioQueue f ->  IO ()
 insertNode ex@(ExN n) (PQ pqr) = 

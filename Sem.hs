@@ -50,11 +50,13 @@ switchE (B (E h) t) = E $ go h (getE $ forgetDiagE t) where
   go (h : t) (Nothing : st)    = h : go t st
 
 joinB :: B (B a) -> B a
+joinB b@(B (B a ei) eo) = B a (switchE (changes <$> b) `unionL` observeE (valueB <$> eo)
+{-
 joinB (B (B i ui) uo) = B i $ E $ go (getE ui) (getE $ forgetDiagB uo)
   where go :: [Maybe a] -> [Maybe (B a)] -> [Maybe a]
         go _ (Just (B hi (E (ei : t))) : st) = Just (fromMaybe hi ei) : go t st
         go (h : t) (Nothing : st)            = h : go t st
-
+-}
 
 
 -- derived

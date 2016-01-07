@@ -1,7 +1,7 @@
 
 {-# Language MagicHash,Rank2Types,ImpredicativeTypes, GADTs, KindSignatures #-} 
 module IncTopoSort(Node,  ExNode(..), Level,  newNode, addEdge, removeEdge, getAliveParents, ensureLevel, removeParents, getLevel, isBefore, eqConv, readNode, writeNode, scheduleParents,
-                   PrioQueue, emptyPqueue, isInQueue, insertNode, dequeue, insertNodeNub) where
+                   PrioQueue,isEmptyPqueue, emptyPqueue, isInQueue, insertNode, dequeue, insertNodeNub) where
 
 import Data.Int
 import Data.Graph hiding (Node) 
@@ -149,6 +149,9 @@ newDullNode = toSomeNode <$> newNode (Id ())
 
 emptyPqueue :: IO (PrioQueue f)
 emptyPqueue = PQ <$> newIORef empty
+
+isEmptyPqueue :: PrioQueue f -> IO Bool
+isEmptyPqueue (PQ q) = null <$> readIORef q
 
 isInQueue :: ExNode f -> PrioQueue f -> IO Bool
 isInQueue (ExN n) (PQ pqr) = 

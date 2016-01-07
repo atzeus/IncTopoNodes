@@ -103,6 +103,11 @@ scanE f i e =
     let em = (\v -> do i <- valueB b; pure (f i v)) <$> e
     in step i (observeE em)
 
+edgeJust :: B (Maybe a) -> E a
+edgeJust b = filterJust $ edge <$> b <@< changes b
+  where edge (Nothing,Just x) = Just x
+        edge _                = Nothing
+
 
 -- semantic functions
 -- forget everything _before_ the given time

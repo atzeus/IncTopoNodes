@@ -20,6 +20,7 @@ import Test.HUnit (assert, Assertion)
 import Control.Applicative
 import qualified Sem as S
 import qualified Impl as I
+import qualified ReactiveBananaModel as B
 
 class (Monad b, MonadFix m, Functor e) =>
   Inter b e m | b -> e, e -> b, m -> e, m -> b, b -> m, e -> m where
@@ -97,6 +98,23 @@ instance Inter S.B S.E S.M where
   filterJust = S.filterJust
   observeE = S.observeE
 
+instance Monad B.Behavior where
+  return = pure
+  (>>=) = undefined
+
+instance Inter B.Behavior B.Event B.Moment where
+  step = B.stepper
+  never = B.never
+  unionWith = B.unionWith
+  switchE  = undefined
+  switchEx = B.switchE 
+  switchB = B.switchB
+  valueB = B.valueB
+  isNow = undefined -- I.isNow
+  filterJust = B.filterJust
+  observeE = B.observeE
+  
+
 
 
 main = defaultMain
@@ -151,6 +169,9 @@ main = defaultMain
 interpretModel ::  (forall b e m. Inter b e m => e a -> m (e x)) -> [Maybe a] -> [Maybe x]
 interpretModel f i = S.interpret f i
 
+interpretModelB ::  (forall b e m. Inter b e m => e a -> m (e x)) -> [Maybe a] -> [Maybe x]
+interpretModelB f i = B.interpret f i
+
 interpretGraph :: (forall b e m. Inter b e m => e a -> m (e x)) -> [Maybe a] -> IO [Maybe x]
 interpretGraph = I.interpret
 
@@ -162,6 +183,7 @@ matchesModel
 matchesModel f xs = do
     bs1 <- return $ interpretModel f (singletons xs)
     bs2 <- interpretGraph f (singletons xs)
+ --   bs2 <- return $  interpretModelB f (singletons xs)
     -- bs3 <- interpretFrameworks f xs
     let bs = [bs1,bs2]
     let b = all (==bs1) bs
@@ -190,6 +212,10 @@ testGraph f = interpretGraph (return . f) $ singletons [1..8::Int]
 
 testModelM :: (forall b e m. Inter b e m => e Int -> m (e x)) -> [Maybe x]
 testModelM f = interpretModel f $ singletons [1..8::Int]
+
+testModelbM :: (forall b e m. Inter b e m => e Int -> m (e x)) -> [Maybe x]
+testModelbM f = interpretModelB f $ singletons [1..8::Int]
+
 testGraphM :: (forall b e m. Inter b e m => e Int -> m (e x)) -> IO [Maybe x]
 testGraphM f = interpretGraph f $ singletons [1..8::Int]
 

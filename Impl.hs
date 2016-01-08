@@ -10,7 +10,7 @@ import Control.Monad.Fix
 import Data.Maybe
 import System.IO.Unsafe
 import Control.Monad.Reader
-
+import Control.Concurrent.MVar -- for callbacks
 -- todo: more same context checks
 -- joinB
 -- clean up
@@ -98,9 +98,9 @@ viewM (M m)               = Act m Return
 viewM (Return x)          = Pure x
 
 
-step i b = M $ Step i b
-valueB b = M $ ValueB b
-isNow e = M $ IsNow e
+stepm i b = M $ Step i b
+valueBm b = M $ ValueB b
+isNowm e = M $ IsNow e
 unsafeMomentIO i = M $ LiftIO i
 
 
@@ -385,8 +385,8 @@ observeE (E e n) = E e node where
 
  
 
-doIteration :: Env -> IO ()
-doIteration e = visitNodes where
+doNodes :: Env -> IO ()
+doNodes e = visitNodes where
  visitNodes = 
   do x <- dequeue (queue e)
      case x of
@@ -434,22 +434,24 @@ interpret f (h : t) =
      emit env (f (E env i)) fakeE
      let E _ res = observeE (E env fakeE)
      seq res return () -- construct network.. sneakily
-     doIteration env
+     doNodes env
      e <- readESure res 
      n <- case e of
       Never -> newE (return ())
       E _ n -> return n
      seq n (return ()) -- this forcing might lead to more network
-     doIteration env
+     doNodes env
      loop env i n t where
   loop env i r [] = (\x -> [x]) <$> readE r
   loop env i r (h : t) = 
       do x <- readE r
          cleanUp env
          maybe (return ()) (\x -> emit env x i) h
-         doIteration env
+         doNodes env
          (x :) <$> loop env i r t
      
+
+
 
 instance Applicative M where
   pure = return
@@ -458,5 +460,112 @@ instance Applicative M where
 instance Functor M where fmap = liftM
 
 
-        
+-- IO interface
+
+class MonadFix m => MonadMoment m where
+   isNow :: E a -> m (Maybe a)
+   valueB :: B a -> m a
+   step   :: a -> E a -> m (B a)
+
+instance MonadMoment M where
+  isNow = isNowm
+  valueB = valueBm
+  step = stepm
+
+data Emit where
+  EmitDrop   :: Node (EState a) -> a -> Emit
+  EmitSpill  :: Node (EState a) -> a ->  Emit
+  EmitGather :: Node (EState [a]) -> a -> Emit
+
+
+data IOEnv = IOEnv { schedule :: IO () -> IO (), updates :: IORef [Emit], strongRef :: IORef [ExNode EState], penv :: Env }
+
+newtype MomentIO a = MI {getM :: ReaderT IOEnv M a } deriving (Functor,Applicative,Monad,MonadFix)
+
+liftIO :: IO a -> MomentIO a
+liftIO i = MI $ ReaderT $ \_ -> (unsafeMomentIO i)
+
+plan :: E (MomentIO a) -> MomentIO (E a)
+plan e = MI $ ReaderT $ \ie -> 
+      let e' = observeE $ (\m -> runReaderT (getM m) ie) <$> e 
+      in do case e' of
+             Never -> return Never
+             E _ n -> n `seq` (unsafeMomentIO (modifyIORef (strongRef ie) (ExN n :))) >> return e'
+  where forceE Never = return ()
+        forceE (E _ n) = n `seq` return ()
+
+-- the callbackmode specifies what happens in case the callback is 
+-- called multiple times in one round
+
+
+{-
+runFRP :: (IO () -> IO ()) ->  -- An IO action that schedules some FRP actions to be run. The callee should ensure that all actions that are scheduled are ran on the same thread and that actions are executed first in first out.
+          MomentIO () ->
+          IO ()
+runFRP schedule (MI m) = 
+ do env <- Env <$> newUnique <*> emptyPqueue <*> newIORef (ES [] [] []) 
+    q <- newIORef []
+    
+     doNodes env
+     e <- readESure res 
+     n <- case e of
+      Never -> newE (return ())
+      E _ n -> return n
+     seq n (return ()) -- this forcing might lead to more network
+     doNodes env
+     loop env i n t where
+-}
+
+
+doIteration :: IOEnv -> IO ()
+doIteration ie = 
+  do emits <- reverse <$> readIORef (updates ie)
+     writeIORef (updates ie) []
+     spill <- catMaybes <$> mapM doEmit emits
+     if null emits
+      then return ()
+      else do doNodes (penv ie)
+              cleanUp (penv ie)
+              if null spill
+              then return ()
+              else schedule ie $ 
+                     do ups <- readIORef (updates ie)
+                        writeIORef (updates ie) (spill ++ ups)
+                        schedule ie  $ doIteration ie
+  where doEmit :: Emit -> IO (Maybe Emit)
+        doEmit (EmitDrop n x) = emit (penv ie) x n >> return Nothing
+        doEmit em@(EmitSpill n x) = 
+          do s <- readE n
+             case s of
+               Nothing -> emit (penv ie) x n >> return Nothing
+               Just x -> return (Just em)
+        doEmit (EmitGather n x) = 
+          do  s <- readNode n
+              case curEmit s of
+               Nothing -> emit (penv ie) [x] n
+               Just t -> writeNode n (s { curEmit = Just (x : t)})
+              return Nothing
+
+
+callbackDrop ::  MomentIO (a -> IO (), E a)
+callbackDrop = callbackImp EmitDrop
+
+callbackSpill ::  MomentIO (a -> IO (), E a)
+callbackSpill = callbackImp EmitSpill
+
+callbackGather ::  MomentIO (a -> IO (), E [a])
+callbackGather = callbackImp EmitGather
+
+callbackImp :: (Node (EState x) -> a -> Emit) -> MomentIO (a -> IO (), E x)
+callbackImp f = MI $ ReaderT $ \ie -> 
+       do n <- unsafeMomentIO $ newE (return ())
+          return (cb ie. f n, E (penv ie) n)
+  where cb ie e = schedule ie $ 
+         do ups <- readIORef (updates ie) 
+            writeIORef (updates ie)  (e : ups)
+            schedule ie $ doIteration ie 
+
+     
+
+    
 

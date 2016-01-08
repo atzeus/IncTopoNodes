@@ -1,5 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving,DeriveFunctor,StandaloneDeriving, ViewPatterns #-}
-
+module Sem where 
 import Control.Monad
 import Control.Monad.Fix
 import Test.QuickCheck 
@@ -29,8 +29,8 @@ unionWith :: (a -> a -> a) -> E a -> E a -> E a
 unionWith f (E l) (E r) = E $ zipWith combine l r
   where combine a b = (f <$> a <*> b) `mplus` a `mplus` b
 
-filterJusts :: E (Maybe a) -> E a
-filterJusts (E l) = E $ map join l
+filterJust :: E (Maybe a) -> E a
+filterJust (E l) = E $ map join l
 
 step :: a -> E a -> M (B a)
 step i e = M $ \t -> B i (forgetE t e)
@@ -50,7 +50,7 @@ switchE (B (E h) t) = E $ go h (getE $ forgetDiagE t) where
   go (h : t) (Nothing : st)    = h : go t st
 
 joinB :: B (B a) -> B a
-joinB b@(B (B a ei) eo) = B a (switchE (changes <$> b) `unionL` observeE (valueB <$> eo)
+joinB b@(B (B a ei) eo) = B a $ switchE (changes <$> b) `unionL` observeE (valueB <$> eo)
 {-
 joinB (B (B i ui) uo) = B i $ E $ go (getE ui) (getE $ forgetDiagB uo)
   where go :: [Maybe a] -> [Maybe (B a)] -> [Maybe a]
@@ -93,7 +93,7 @@ unionLR :: E a -> E b -> E (LR a b)
 unionLR l r = unionWith (\(L a) (R b) -> LR a b) (L <$> l) (R <$> r)
 
 coincide :: E (a -> b) -> E a -> E b
-coincide f v = filterJusts $ applyEm <$> unionLR f v
+coincide f v = filterJust $ applyEm <$> unionLR f v
   where applyEm (LR f v) = Just (f v)
         applyEm _        = Nothing
 
@@ -104,9 +104,9 @@ scanE f i e =
     in step i (observeE em)
 
 edgeJust :: B (Maybe a) -> E a
-edgeJust b = filterJust $ edge <$> b <@< changes b
-  where edge (Nothing,Just x) = Just x
-        edge _                = Nothing
+edgeJust b = filterJust $ (edge <$> b) <@< changes b
+  where edge Nothing (Just x) = Just x
+        edge _        _       = Nothing
 
 
 -- semantic functions
@@ -190,7 +190,7 @@ prop_filterForget l' =
   in forAll (choose (0,n)) $ \t ->
      let forget = forgetE t
          l =?= r = trimE t n l === trimE t n r
-     in forget (filterJusts l) =?= filterJusts (forget l)
+     in forget (filterJust l) =?= filterJust (forget l)
 
 
 prop_unionForget :: E Int -> E Int -> Property

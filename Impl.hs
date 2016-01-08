@@ -1,6 +1,6 @@
 {-# Language ScopedTypeVariables, GADTs,GeneralizedNewtypeDeriving, ViewPatterns, TupleSections #-} 
 
-module Impl where
+module Impl(B,E,M, step, valueB, isNow, unionWith, never, filterJust, observeE, switchE, scanE, interpret)  where
 
 import IncTopoSort
 import System.Mem.Weak
@@ -31,7 +31,9 @@ instance Eq Env where
   a == b = uid a == uid b
 
 data B a = Const a
-         | B !Env (IORef a,Node (EState a)) -- forcing this tuple leads to IO actions
+         | B (IORef a) (E a) -- forcing these values tuple leads to IO actions
+
+never =Never
 
 data E a = Never
          | E !Env (Node (EState a)) -- forcing the node leads to IO actions
@@ -60,7 +62,7 @@ data E a = Never
 data EState a = EState {
   action     :: !(IO ()),
   curEmit    :: !(Maybe a),
-  behav      :: ![ Weak (IORef a)]
+  behav      :: ![Weak (IORef a)]
  }
 
 
@@ -88,6 +90,13 @@ instance Monad M where
 instance MonadFix M where
   mfix f = M $ Fix f
 
+viewM :: forall a. M a -> ViewM a
+viewM (Bind (Bind m f) g) = viewM $ Bind m (\x -> Bind (f x) g) 
+viewM (Bind (Return x) f) = viewM $ f x
+viewM (Bind (M x) f)      = Act x f
+viewM (M m)               = Act m Return 
+viewM (Return x)          = Pure x
+
 
 step i b = M $ Step i b
 valueB b = M $ ValueB b
@@ -101,21 +110,17 @@ newE :: IO () -> IO (Node (EState a))
 newE a = newNode (EState a Nothing [])
 
 dependOn :: Env -> Node (EState a) -> Node (EState b) -> IO ()
-dependOn e n m = 
+dependOn env n m = 
    do addEdge n m
       x <- readE m
       case x of
-        Just _ -> insertNodeNub (queue e) (ExN n)
+        Just _ -> insertNodeNub (queue env) (ExN n)
         Nothing -> return ()
 
-makeBehaviorOf :: a -> Node (EState a) -> IO (IORef a, Node (EState a))
-makeBehaviorOf i m = 
-  do r <- newIORef i
-     wr <- mkWeakIORef r (return ())
-     es <- readNode m
-     writeNode m (es { behav = wr : behav es})
-     return (r,m)
-
+registerStep :: IORef a -> E a -> IO ()
+registerStep r (E _ n) = do es <- readNode n
+                            wr <- mkWeakIORef r (return ())
+                            writeNode n (es {behav = wr : behav es})
 
 -- scheduled IO actions
 
@@ -129,9 +134,9 @@ readB :: Env -> B a -> IO a
 readB e b = do s <- readIORef (envState e)
                writeIORef (envState e) (s {seqs = (res `seq` ()) : seqs s })
                return res
-  where res = unsafePerformIO $ 
-                 let B _ (r,_) = b
-                 in readIORef r
+  where res = case b of
+               Const x -> x
+               B r _ -> unsafePerformIO $ readIORef r
 
 
 setAction :: Node (EState a) -> IO () -> IO ()
@@ -172,7 +177,7 @@ unionWith f (E el nl) (E er nr)
 instance Functor E where
   fmap f Never  = Never
   fmap f (E e n) = E e node where
-    node =   unsafePerformIO $ 
+    node =  unsafePerformIO $ 
           do  m <- newE fm
               dependOn e m n
               return m
@@ -182,7 +187,7 @@ instance Functor E where
 filterJust :: E (Maybe a) -> E a
 filterJust Never = Never
 filterJust (E e n) = E e node where
-  node =   unsafePerformIO $ 
+  node =  unsafePerformIO $ 
          do  m <- newE fil
              dependOn e m n
              return m
@@ -193,73 +198,152 @@ filterJust (E e n) = E e node where
 
 switchE :: B (E a) -> E a
 switchE (Const x)  = x
-switchE (B env (r,n)) = E env node where
+switchE (B r (E env n)) = E env node where
   node = unsafePerformIO $ 
-         do  (E _ i) <- readIORef r 
-             m <- newE (switchEm i) 
-             dependOn env m i
+         do  e <- readIORef r 
+             m <- newE (switchEm e) 
+             case e of
+               Never -> return ()
+               E _ i -> dependOn env m i
              dependOn env m n
              return m
   switchEm i = 
     do x <- readE n
        case x of
-        Just (E _ v) -> do removeEdge node i
-                           setAction node (switched v) 
-                           dependOn env node v
-        Nothing -> do x <- readE i
-                      case x of
-                         Just v -> emit env v node
-                         Nothing -> return () 
-  switched i = 
+        Just Never   -> remove >> setAction node (switched Never) 
+        Just e@(E _ v) -> do remove
+                             setAction node (switched e) 
+                             dependOn env node v
+        Nothing -> case i of
+                     Never -> return ()
+                     E _ i -> do x <- readE i
+                                 case x of
+                                   Just v -> emit env v node
+                                   Nothing -> return ()
+     where remove =  case i of
+                         Never -> return () 
+                         E _ i -> removeEdge node i
+  switched e@(E _ i) = 
      do x <- readE i
         case x of
           Just v -> emit env v node
           Nothing -> return ()
-        setAction node (switchEm i) 
-
+        setAction node (switchEm e) 
 
 
 instance Functor B where
   fmap f (Const x) = Const (f x)
-  fmap f (B env t) = B env $ content where
-    content = unsafePerformIO $
-        do let (ref,n) = t
-           v <- readIORef ref
-           let E _ m = fmap f (E env n)
-           makeBehaviorOf (f v) m
+  fmap f (B r e) = B ref evs where
+    evs = fmap f e
+    ref = unsafePerformIO $
+        do v <- readIORef r
+           res <- newIORef (f v)
+           registerStep res evs
+           return res
 
 
 
 instance Applicative B where
   pure x = Const x
-  (B env ~(fr,fe)) <*> (B _ ~(vr,ve)) = B env content where
-   content = unsafePerformIO $
-        do f <- readIORef fr
-           v <- readIORef vr
-           r' <- newIORef (f v)
-           n <- newE combineEm
-           dependOn env n fe
-           dependOn env n ve
-           return (r',n)
+  (Const f) <*> x = fmap f x
+  f <*> (Const x) = fmap ($ x) f
+  (B fr (E env fn)) <*> (B vr (E _ vn)) = B ref up where
+   ref = unsafePerformIO $
+     do f <- readIORef fr
+        v <- readIORef vr
+        r' <- newIORef (f v)
+        registerStep r' up
+        return r'
+   up = E env node
+   node = unsafePerformIO $
+        do n <- newE combineEm
+           dependOn env n fn
+           dependOn env n vn
+           return n
           
-
    combineEm = 
-      do let (_,node) = content
-         l <- readE fe
-         r <- readE ve
+      do l <- readE fn
+         r <- readE vn
          v <- case (l,r) of
            (Just x, Just y ) -> return (x y)
            (Just x, Nothing) -> x <$> readIORef vr
            (Nothing, Just y) -> ($ y) <$> readIORef fr
          emit env v node
 
+joinB :: B (B a) -> B a
+joinB (Const x) = x
+joinB (B r (E env no)) = B ref up where
+   ref = unsafePerformIO $
+     do b <- readIORef r
+        v <- case b of
+               Const x -> return x
+               B r _   -> readIORef r
+        r <- newIORef v
+        registerStep r up
+        return r
+   up = E env node
+   node = unsafePerformIO $
+    do b <- readIORef r
+       n <- newE (switchEm b)
+       case b of
+           Const x -> return ()
+           B _ (E _ ni)   -> dependOn env n ni
+       dependOn env n no
+       return n
 
-viewM :: forall a. M a -> ViewM a
-viewM (Bind (Bind m f) g) = viewM $ Bind m (\x -> Bind (f x) g) 
-viewM (Bind (Return x) f) = viewM $ f x
-viewM (Bind (M x) f)      = Act x f
-viewM (M m)               = Act m Return 
-viewM (Return x)          = Pure x
+   switchEm b = 
+    do x <- readE no
+       case x of
+        Just (Const x) -> do setAction node (switchEm (Const x))
+                             remove
+                             emit env x node
+        Just b@(B ri' (E _ ni')) -> 
+            do remove
+               lev <- getLevel ni'
+               myLev <- getLevel node
+               if myLev > lev
+                then do x <- readE ni'
+                        v <- case x of
+                          Just v  -> return v
+                          Nothing -> readIORef ri'
+                        emit env v node
+                        setAction node (switchEm b)
+                else do setAction node (switched b)
+                        insertNodeNub (queue env) (ExN node)
+
+        Nothing -> do case b of
+                        Const x -> error "weirdness"
+                        B r (E _ n) -> 
+                          do x <- readE n
+                             case x of
+                              Just v  -> emit env v node
+                              Nothing -> return () 
+     where remove =  case b of
+                         Const _ -> return () 
+                         B _ (E _ i) -> removeEdge node i
+   switched b@(B ri (E _ ni)) = 
+     do x <- readE ni
+        v <- case x of
+          Just v -> return v
+          Nothing -> readIORef ri
+        emit env v node
+        setAction node (switchEm b) 
+
+instance Monad B where
+  return = pure
+  m >>= f = joinB (fmap f m)
+
+stepImp :: Env -> a -> E a -> IO (B a)
+stepImp env i e =
+  do s <- readIORef (envState env)
+     writeIORef (envState env) (s {seqs = (res `seq` ()) : seqs s })
+     return res
+  where res = case e of
+               Never -> Const i
+               E _ n  -> unsafePerformIO $
+                            do r <- newIORef i
+                               registerStep r e
+                               return (B r e)
 
 observeE :: E (M a) -> E a
 observeE Never   = Never
@@ -277,12 +361,11 @@ observeE (E e n) = E e node where
      case m of
        LiftIO m -> m >>= loop . f
        ValueB b -> readB e b >>= loop . f
-       Step i (E _ en) -> (B e <$> makeBehaviorOf i en) >>= loop . f
+       Step i e' -> stepImp e i e' >>= loop . f
        IsNow (E e' m) 
         | e /= e' -> error "Not the right FRP context for this moment!"
         | otherwise ->   
-            do es <- readIORef (envState e)
-               lev <- getLevel n
+            do lev <- getLevel m
                myLev <- getLevel node
                if myLev > lev
                then readE m >>= loop . f
@@ -293,14 +376,14 @@ observeE (E e n) = E e node where
                        setAction node (loop a)
                        insertNodeNub (queue e) (ExN node)
        Fix fx -> 
-         do r <- newIORef undefined
+         do r <- newIORef (error "FRPFix loop")
             let v = unsafePerformIO $ readIORef r
             let a' = do x <- fx v
                         unsafeMomentIO $ writeIORef r x
                         return x
             loop (a' >>= f)
 
-   
+ 
 
 doIteration :: Env -> IO ()
 doIteration e = visitNodes where
@@ -333,7 +416,7 @@ cleanUp e =
         mapM (\b -> writeIORef b x) (catMaybes bm)
         let b' = catMaybes $ zipWith (\x y -> x <$ y) (behav es) bm
         writeNode n (es { behav = b', curEmit = Nothing})
-        
+       
 scanE :: (b -> a -> b) -> b -> E a -> M (B b)
 scanE f i e = 
   mfix $ \b ->
@@ -341,9 +424,8 @@ scanE f i e =
     in step i (observeE em)
 
 
-test = interpret (scanE (+) 0) [if x `mod` 1 == 0 then Just 1 else Nothing | x <- [0..100000]]
 
-interpret :: (E a -> M (B b)) -> [Maybe a] -> IO [b]     
+interpret :: (E a -> M (E b)) -> [Maybe a] -> IO [Maybe b]     
 interpret f (h : t) =
   do env <- Env <$> newUnique <*> emptyPqueue <*> newIORef (ES [] []) 
      i <- newE  (return ())
@@ -353,12 +435,16 @@ interpret f (h : t) =
      let E _ res = observeE (E env fakeE)
      seq res return () -- construct network.. sneakily
      doIteration env
-     (B _ (r,_)) <- readESure res -- this forcing might lead to more network
+     e <- readESure res 
+     n <- case e of
+      Never -> newE (return ())
+      E _ n -> return n
+     seq n (return ()) -- this forcing might lead to more network
      doIteration env
-     loop env i r t where
-  loop env i r [] = (\x -> [x]) <$> readIORef r
+     loop env i n t where
+  loop env i r [] = (\x -> [x]) <$> readE r
   loop env i r (h : t) = 
-      do x <- readIORef r
+      do x <- readE r
          cleanUp env
          maybe (return ()) (\x -> emit env x i) h
          doIteration env

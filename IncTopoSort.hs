@@ -4,11 +4,11 @@ module IncTopoSort(
      -- $intro
      -- * Mutable cell operations
      Node, 
-     newNode, readNode, writeNode,
+     newNode, readNode, writeNode, modifyNode, modifyNode',
      -- * Ordering operations
-      Ex(..), Level,  getLevel, isBefore,  addEdge, removeEdge, getParents, ensureLevel, removeIngoingEdges,
+      Ex(..), ExNode(..), Level,  getLevel, isBefore,  addEdge, removeEdge, getParents, ensureLevel, removeIngoingEdges,
      -- * Priority queue
-     PrioQueue,isEmptyPqueue, emptyPqueue, insertNode, dequeue) where
+     PrioQueue,isEmptyPqueue, emptyPqueue, insertPQ, scheduleParents, dequeue) where
 
 import Data.Int
 import Data.Graph hiding (Node) 
@@ -67,17 +67,13 @@ newtype Node (f :: * -> *) a = Node (IORef TopoInfo) deriving Eq
 data Ex f where
   Ex :: f a -> Ex f
 
+data ExNode f where
+  ExNode :: Node f a -> ExNode f
 
 
 
 
-
-eqConv :: Node g a -> Node g b -> Maybe (f a -> f b)
-eqConv (Node x) (Node y) | x == y    = Just unsafeCoerce
-                         | otherwise = Nothing
-
-
-newNode :: f a -> IO (Node f a)
+newNode ::  f a -> IO (Node f a)
 newNode a = do r <- newIORef (TopoNode [] (unsafeCoerce# a) minBound)
                return (Node r)
 
@@ -88,6 +84,17 @@ writeNode :: Node f a -> f a -> IO ()
 writeNode (Node r) a = 
   do v <- readIORef r
      writeIORef r (v {info = unsafeCoerce# a}) 
+
+modifyNode :: Node f a -> (f a -> f a) -> IO ()
+modifyNode n f = do x <- readNode n
+                    let y = f x
+                    writeNode n y
+
+
+modifyNode' :: Node f a -> (f a -> f a) -> IO ()
+modifyNode' n f = do x <- readNode n
+                     let y = f x
+                     y `seq` writeNode n y
 
 {-| @addEdge from to@ creates an edge from @from@ to @to@. Returns @False@ if the edge could not be added because this edge would cause a loop. In case the edge already exists, nothing is done.
 -}
@@ -118,6 +125,8 @@ edgeExists (Node from) (Node to) =
          case s of
            Just q  | q == from -> return False
            _ -> loop t
+
+
 
 
 ensureLevel' :: Level -> Node f a -> IO Bool
@@ -158,7 +167,7 @@ removeIngoingEdges (Node to) =
 
 {-| @removeEdge from to@ remove an edge from @from@ to @to@.
 -}
-removeEdge :: Node f a -> Node f b-> IO ()
+removeEdge :: Node f a -> Node f b -> IO ()
 removeEdge (Node from) (Node to) = 
   do toInfo <- readIORef to
      parents' <- loop (parents toInfo) 
@@ -172,15 +181,15 @@ removeEdge (Node from) (Node to) =
 
 {-| Gives all parent nodes of the given node (who have not been garbage collected).
 -}
-getParents :: Node f a -> IO [Ex (Node f)]
+getParents :: Node f a -> IO [ExNode f]
 getParents (Node n) = 
      do pr <- parents <$> readIORef n
-        map (Ex . Node) . catMaybes <$> mapM deRefWeak pr
+        map (ExNode . Node) . catMaybes <$> mapM deRefWeak pr
 
 {-| A priority queue which gives nodes in order of the partial order defined by the dag. The priority queue containing 'ExNode' elements of type @ExNode f@. Note that the order of
     the elements is always corresponds with the dag from which the nodes originate, even when their order changes after inserting them.
 -}
-newtype PrioQueue f = PQ (IORef (IM.MinPQueue Int (Ex (Node f)))) deriving Eq
+newtype PrioQueue f = PQ (IORef (IM.MinPQueue Int (ExNode f)) ) deriving Eq
 
 
 emptyPqueue :: IO (PrioQueue f)
@@ -189,45 +198,44 @@ emptyPqueue = PQ <$> newIORef IM.empty
 isEmptyPqueue :: PrioQueue f -> IO Bool
 isEmptyPqueue (PQ q) = null <$> readIORef q
 
-{-| Add all parents of the given node to the queue.
--}
-scheduleParents ::  PrioQueue f -> Node f a -> IO ()
-scheduleParents p n = 
- do ps <- getParents n
-    mapM_ (\(Ex n) -> insertNode n p) ps
-
-      
+scheduleParents :: PrioQueue f -> Node f x ->  IO ()
+scheduleParents pq n = 
+  do ps <- getParents n
+     mapM_ (\(ExNode p) -> insertPQ pq p) ps
       
 
-insertNode :: Node f a -> PrioQueue f ->  IO ()
-insertNode n (PQ pqr) = 
+insertPQ :: PrioQueue f -> Node f x ->  IO ()
+insertPQ (PQ pqr) n = 
    do pq <- readIORef pqr
       lev <- getLevel n
-      writeIORef pqr ( IM.insert lev (Ex n) pq)
+      writeIORef pqr ( IM.insert lev (ExNode n) pq)
 
-dequeue :: PrioQueue f -> IO (Maybe (Ex (Node f)))
+dequeue :: PrioQueue f -> IO (Maybe (ExNode f))
 dequeue (PQ pqr) =
   do pq <- readIORef pqr
      case IM.minViewWithKey pq of
        Nothing -> return Nothing 
-       Just ( (lev, n@(Ex node)), pq') -> 
+       Just ( (lev, n@(ExNode node)), pq') -> 
           do lev' <- getLevel node
              if lev == lev' 
              then do writeIORef pqr pq'
                      return (Just n)
                 else do writeIORef pqr (IM.insert lev' n  pq')
                         dequeue (PQ pqr)
+
+ 
                                   
 
 
 --- Below: Testing code
 
-data Id x = Id x
 
 type NNode = Node Id ()
 
+data Id a = Id a
+
 newDullNode :: IO NNode
-newDullNode = newNode (Id ()) 
+newDullNode = newNode (Id ())
 
 -- check concistency with Data.Graph toposort
 propIsCorrect :: AdjList -> Property

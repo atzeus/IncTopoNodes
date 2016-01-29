@@ -1,25 +1,28 @@
-{-# Language FlexibleInstances,ScopedTypeVariables, GADTs,GeneralizedNewtypeDeriving, ViewPatterns, TupleSections #-} 
+{-# Language GADTs #-} 
 
-module EventNetwork(E, newBaseE , runEmits, TRef, newTRef, readTRef, iteration, newEnv)  where
+module EventNetwork(ENode, Emits(..), EmitState(..), newBaseE , runEmits, TRef, newTRef, readTRef, iteration, Env,newEnv, Ex(..))  where
 import FList 
 import IncTopoSort
 import System.Mem.Weak
 import Data.IORef
 import Data.Maybe
-import System.IO.Unsafe
+import Data.Unique
 
 data Env = Env {
+  uuid     :: Unique,
   queue    :: !(PrioQueue EState),
-  clean    :: !(IORef [Ex E]) 
+  clean    :: !(IORef [Ex ENode]) 
  }
 
-data Await a where
-  Await  :: FList E l -> (FList Maybe l -> IO (EmitState a)) -> Await a
+instance Eq Env where
+  l == r = uuid l == uuid r
 
-data EmitState a = WaitMore (Await a)
-                 | Commit (Maybe a) (Await a)
+data Emits a where
+  Await  :: FList ENode l -> (FList Maybe l -> IO (EmitState a)) -> Emits a
 
-type Emits a = IO (Await a)
+data EmitState a = WaitMore (Emits a)
+                 | Commit (Maybe a) (Emits a)
+
 
 data EState a = EState {
   action     :: !(IO ()),
@@ -28,23 +31,24 @@ data EState a = EState {
   behav      :: ![Weak (IORef a)]
  }
 
-data E a = E (Node EState a)
+data ENode a = E !(Unique) !(Node EState a)
 
 
-runEmits :: Env -> Emits a -> IO (E a)
+runEmits :: Env -> Emits a -> IO (ENode a)
 runEmits env e = 
   do n <- newNode (EState (return ()) Nothing False [])
-     a <- e
-     runAwait n a
-     return (E n) where
+     runAwait n e
+     return (E (uuid env) n) where
 
   runAwait n a =
     do setupAwait n a  
        insertPQ (queue env) n
 
   setupAwait n a@(Await l f) =
-    do addEdges n l
-       setAction n (reactAwait n a)
+    do if checkUid l
+       then do addEdges n l
+               setAction n (reactAwait n a)
+       else error "Event nodes not from same enviroment!"
 
   reactAwait n (Await l f) =
     do ss <- getStates l
@@ -58,25 +62,28 @@ runEmits env e =
                 Commit v m -> do commit env n v
                                  setupAwait n m                                                                   
 
-  addEdges    n l = sequence $ toList (\(E to) -> addEdge n to) l
+
+  addEdges    n l = sequence $ toList (\(E _ to) -> addEdge n to) l
+  checkUid :: FList ENode l -> Bool
+  checkUid    l   = all id $ toList (\(E u _) -> uuid env == u) l
   getStates   l   = mapfM readE l
-  removeEdges n l = sequence $ toList (\(E to) -> removeEdge n to) l
+  removeEdges n l = sequence $ toList (\(E _ to) -> removeEdge n to) l
   ifFirst     n a = do x <- visited <$> readNode n
                        if x then return () else a
   setAction   n a = modifyNode' n (\x -> x {action = ifFirst n a})
 
-  readE (E n) = curEmit <$> readNode n
+  readE (E _ n) = curEmit <$> readNode n
 
 commit env n v = do setEmit n v
                     addClean n
                     scheduleParents (queue env) n
   where setEmit n a = modifyNode' n (\x -> x {curEmit = a, visited = True})
-        addClean  n = modifyIORef' (clean env) (Ex (E n) :)
+        addClean  n = modifyIORef' (clean env) (Ex (E (uuid env) n) :)
 
 newtype TRef a = TRef (IORef a)
 
-newTRef :: a -> E a -> IO (TRef a)
-newTRef a (E e) = 
+newTRef :: a -> ENode a -> IO (TRef a)
+newTRef a (E _ e) = 
    do r <- newIORef a 
       wr <- mkWeakIORef r (return ())
       modifyNode' e (\s -> s {behav = wr : behav s})
@@ -91,7 +98,7 @@ cleanUp e =
        mapM_ cleanE s
        writeIORef (clean e) [] where
 
- cleanE (Ex (E n))  =
+ cleanE (Ex (E _ n))  =
    do es <- readNode n    
       writeNode n (es {curEmit = Nothing, visited = False})              
       case curEmit es of
@@ -120,11 +127,11 @@ iteration env = do handleQueue env
                    cleanUp env
 
 newEnv :: IO Env 
-newEnv = Env <$> emptyPqueue <*> newIORef []
+newEnv = Env <$> newUnique <*> emptyPqueue <*> newIORef []
 
-newBaseE :: Env -> IO (E a, a -> IO ())
+newBaseE :: Env -> IO (ENode a, a -> IO ())
 newBaseE env =
     do n <- newNode (EState (return ()) Nothing False [])
-       return (E n, emit n) where
+       return (E (uuid env) n, emit n) where
    emit n x = commit env n (Just x)
 

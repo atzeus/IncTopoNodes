@@ -4,9 +4,9 @@ module IncTopoSort(
      -- $intro
      -- * Mutable cell operations
      Node, 
-     newNode, readNode, writeNode, modifyNode, modifyNode',
+     newNode, readNode, writeNode, modifyNode, modifyNode', heqNode,
      -- * Ordering operations
-      Ex(..), ExNode(..), Level,  getLevel, isBefore,  addEdge, removeEdge, getParents, ensureLevel, removeIngoingEdges,
+      Ex(..), ExNode(..), Level,  getLevel, isBefore,  addEdge, removeEdge, getParents, ensureLevel, removeIngoingEdges, ensureAfter,
      -- * Priority queue
      PrioQueue,isEmptyPqueue, emptyPqueue, insertPQ, scheduleParents, dequeue) where
 
@@ -55,7 +55,8 @@ getLevel (Node n) = level <$> readIORef n
 isBefore :: Node f a -> Node f b -> IO Bool
 isBefore l r = (<) <$> getLevel l <*> getLevel r
 
-
+heqNode :: Node f a -> Node f b -> Bool
+heqNode (Node l) (Node r) = l == r
 
 {-| A node in the graph, containing a mutable cell for values of type @f a@.
 -}
@@ -100,14 +101,10 @@ modifyNode' n f = do x <- readNode n
 -}
 addEdge :: Node f a -> Node f b -> IO Bool
 addEdge from@(Node fr) to@(Node tor) = 
-  do ee <-  edgeExists from to
-     if ee
-     then return True
-     else 
-      do toInfo  <- readIORef tor
-         notLoop <- ensureLevel' (level toInfo + 1) from
+      do notLoop <- ensureAfter from to
          if notLoop 
-         then do wTo  <- mkWeakIORef tor (return ())  
+         then do toInfo  <- readIORef tor
+                 wTo  <- mkWeakIORef tor (return ())  
                  fref <- mkWeakIORef fr (removeEdgeWeak from wTo)
                  writeIORef tor (toInfo {parents = fref : parents toInfo} )
          else return ()
@@ -125,6 +122,11 @@ edgeExists (Node from) (Node to) =
          case s of
            Just q  | q == from -> return False
            _ -> loop t
+
+ensureAfter :: Node f a -> Node f b -> IO Bool
+ensureAfter from@(Node fr) to@(Node tor) = 
+      do toInfo  <- readIORef tor
+         ensureLevel' (level toInfo + 1) from
 
 
 
@@ -165,7 +167,7 @@ removeIngoingEdges (Node to) =
      writeIORef to (info { parents = [] })
 
 
-{-| @removeEdge from to@ remove an edge from @from@ to @to@.
+{-| @removeEdge from to@ removes an edge from @from@ to @to@.
 -}
 removeEdge :: Node f a -> Node f b -> IO ()
 removeEdge (Node from) (Node to) = 
@@ -176,7 +178,7 @@ removeEdge (Node from) (Node to) =
   loop (x : t) = 
       do s <- deRefWeak x
          case s of
-           Just q  -> if q == to then loop t else (x :) <$> loop t
+           Just q  -> if q == to then pure t else (x :) <$> loop t
            Nothing -> loop t
 
 {-| Gives all parent nodes of the given node (who have not been garbage collected).

@@ -5,6 +5,7 @@ import Control.Monad.State
 import Data.List
 import Data.Maybe
 import FList 
+import IncTopoSort(Ex(..))
 
 
 type Time = Int
@@ -12,50 +13,54 @@ type Time = Int
 newtype B a = B {runB :: Time -> a } deriving (Functor,Applicative, Monad,MonadFix)
 newtype E a = E {getE :: [Maybe a] }
 
-data Emits a where
-  Await  :: FList E l -> (FList Maybe l -> B (EmitState a)) -> Emits a
+data Emits a = Await  [Ex E] (B (EmitState a)) 
 
-data EmitState a = WaitMore (Emits a)
-                 | Commit (Maybe a) (Emits a)
+data EmitState a = Commit (Maybe a) (Emits a)
 
-
-
+isNow :: E a -> B (Maybe a)
+isNow = undefined
 
 nevere :: Emits a
-nevere = Await X undefined
+nevere = Await [] undefined
 
 fmape :: (x -> y) -> E x -> Emits y
 fmape f e = loop where
- loop = Await (e :. X) $ \(Just x :. X) ->
-      pure $ Commit (Just (f x)) loop
+ loop = Await [Ex e] $
+      do v <- isNow e
+         pure $ Commit (fmap f v) loop
+
 
 filterJust :: E (Maybe a) -> Emits a
 filterJust e = loop where
-  loop = Await (e :. X) $ \(x :. X) ->
-          pure $ Commit (join x) loop
+  loop = Await [Ex e] $
+      do v <- isNow e
+         pure $ Commit (join v) loop
 
 unionWith :: (a -> a -> a) -> E a -> E a -> Emits a 
 unionWith f l r = loop where
- loop = Await (l :. r :. X) $ \(lv :. rv :. X) ->
-         pure (Commit (Just $ combine lv rv) loop)
+ loop = Await [Ex l, Ex r] $
+      do lv <- isNow l
+         rv <- isNow r
+         pure $ Commit (Just $ combine lv rv) loop
  combine (Just x) (Just y) = f x y
  combine Nothing  (Just y) = y
  combine (Just x) Nothing  = x
   
 observeE :: E (B a) -> Emits a
 observeE e = loop where
- loop = Await (e :. X) $ \(Just xm :. X) ->
-         do x <- xm
-            pure $ Commit (Just x) loop
+ loop = Await [Ex e] $
+      do Just v <- isNow e
+         x <- v
+         pure $ Commit (Just x) loop
 
 
 switchE :: E a -> E (E a) -> Emits a 
-switchE b e = go b where
- go i = Await (i :. e :. X) $ \(iv :. ev :. X) ->
-       pure $ case ev of
-         Just i' -> WaitMore $ Await (i' :. e :. X) $ \(iv' :. _ :. X) ->
-                            pure $ Commit iv' (go i')
-         Nothing -> Commit iv (go i)
+switchE b e = loop b where
+ loop i = Await [Ex e, Ex i] $
+     do ev <- isNow e
+        let i' = fromMaybe i ev
+        c <- isNow i'
+        pure $ Commit c (loop i')
 
 
 

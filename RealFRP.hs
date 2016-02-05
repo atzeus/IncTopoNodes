@@ -9,18 +9,24 @@ import Once
 import Control.Monad
 import Control.Monad.Reader
 import Data.IORef
+import Data.Maybe 
 
 data Events   a = E Env (IO (ENode a))
                 | Never
-newtype Behavior a = B { runB :: IO a }  deriving (Functor, Applicative,Monad,MonadFix)
+newtype Behavior a = B { runB :: Obs a }  deriving (Functor, Applicative,Monad,MonadFix)
 type StrongRefs = IORef [Ex ENode]
 
 data NowEnv = NowEnv { strongRefs :: StrongRefs , eenv :: Env } 
 
-newtype Now      a = N (ReaderT NowEnv IO a ) deriving (Functor, Applicative,Monad,MonadFix, MonadIO)
+newtype Now a = N (ReaderT NowEnv Obs a ) deriving (Functor, Applicative,Monad,MonadFix, MonadIO)
 
-runNow :: NowEnv -> Now a -> IO a
+runNow :: NowEnv -> Now a -> Obs a
 runNow sr (N m) = runReaderT m sr
+
+isNow :: Events a -> Behavior (Maybe a)
+isNow (E _ m) = B $
+    do n <- liftIO m
+       checkNode n
 
 class BLike m where
   sample :: Behavior a    -> m a
@@ -29,9 +35,10 @@ class BLike m where
 instance BLike Behavior where
   sample = id
   stepb a (E _ m) = B $
-    do n <- m
-       tr <- newTRef a n 
-       return $ B $ readTRef tr
+    do tr <- liftIO $ 
+              do n <- m
+                 newTRef a n 
+       return $ B $ liftIO $ readTRef tr
 
 instance BLike Now where
   sample b = N $ lift $ runB b
@@ -71,183 +78,250 @@ observe (E env m) =
     do n <- m
        runEmits env (observeE n) 
 
+getE :: Events a -> IO (Maybe (ENode a))
+getE Never = pure Nothing
+getE (E _ m) = Just <$> m
+
+switchEv :: Events a -> Events (Events a) -> Behavior (Events a)
+switchEv i Never = pure i
+switchEv e (E env sm) = B $
+    do r <- liftIO $ 
+             do i <- getE e 
+                s <- sm
+                runEmits env (switchE i s) 
+       return (E env (return r))
+
+
 plan :: Events (Now a) -> Now (Events a)
 plan Never = pure Never
 plan (E env m) = N $ 
-    do n <- lift $ m
+    do n <- liftIO m
        nenv <- ask
        if eenv nenv /= env
        then error "Now not from same FRP context!"
        else return ()
-       r <- lift $ runEmits env (planE nenv n)
-       lift $ modifyIORef' (strongRefs nenv) (Ex r :)
+       r <- liftIO $ runEmits env (planE nenv n)
+       liftIO $ modifyIORef' (strongRefs nenv) (Ex r :)
        return (E env (return r))
-
-switchEv :: Events a -> Events (Events a) -> Behavior (Events a)
-switchEv i Never = pure i
-switchEv Never e@(E env _) = 
-  B $ do (x,_) <- newBaseE env
-         runB $ switchEv (E env (return x)) e
-switchEv (E env im) (E _ sm) = B $
-    do i <- im
-       s <- sm
-       r <-  runEmits env (switchE i s)
-       return (E env (return r))
-
-
-switch :: Step (Events a) -> Events a
-switch (Step b e@(E env _)) = E env $ once $
-  do i <- runB b
-     E _ n <- runB $ switchEv i e
-     n
-
-unsafeStep :: Behavior a -> Events a -> Behavior a
-unsafeStep b (E env m) = B $ 
-  do r <- once $
-       do i <- runB b
-          e <- m
-          newTRef i e
-     readTRef r 
-
-unsafeAppStep :: Behavior (a -> b) -> Events (a -> b) -> Behavior a -> Events a -> Events b
-unsafeAppStep bf (E env fm) bx (E _ xm) = E env $ once $
-  do fe <- fm
-     xe <- xm
-     runEmits env (appStep bf fe bx xe)
 
 callback :: Now (Events a, a -> IO ())
 callback = N $
-   do env <- ask
-      (n,cb) <- lift $ newBaseE (eenv env) 
-      return (E (eenv env) (return n), cb)
+   ask >>= \env ->
+     liftIO $ 
+      do (n,cb) <- newBaseE (eenv env) 
+         return (E (eenv env) (return n), cb)
+
+
+data Step a = Const a
+            | Step Env (IO (TRef a, ENode a)) 
+
+getPrev :: Step a -> Behavior a
+getPrev (Const x) = pure x
+getPrev (Step _ m) = B $ liftIO $ m >>= readTRef .fst 
+
+getUpdates :: Step a -> Events a
+getUpdates (Const _) = never
+getUpdates (Step env m) = E env $ snd <$> m
+
+instance Functor Step where
+  fmap f (Const x) = Const (f x)
+  fmap f (Step env m) = Step env $ once $
+           do (t,n) <- m
+              i <- readTRef t
+              n' <- runEmits env (fmapE f n) 
+              t' <- newTRef (f i) n'
+              return (t',n') 
+              
+
+instance Applicative Step where
+  pure x = Const x
+  (Const f) <*> (Const x) = Const (f x)
+  (Const f) <*> s = fmap f s
+  s <*> (Const x) = fmap ($ x) s
+  (Step env fm) <*> (Step _ xm) = Step env $ once $
+    do (tf,nf) <- fm
+       (tx,nx) <- xm
+       fi <- readTRef tf 
+       xi <- readTRef tx
+       n <- runEmits env (appStep tf nf tx nx) 
+       t <- newTRef (fi xi) n
+       return (t,n)
+
+joinStep :: Step (Step a) -> Step a
+joinStep (Const x) = x
+joinStep (Step env m) = Step env $ once $ 
+  do (t,n) <- m
+     i <- readTRef t 
+     (iv,ie) <- case i of
+       Const x -> pure (x, Nothing)
+       Step _ mi -> do (ti,ie) <- mi
+                       i <- readTRef ti
+                       return (i, Just ie)
+     n' <- runEmits env (joinStepE ie n) 
+     t' <- newTRef iv n' 
+     return (t',n')
+        
+
+switch :: Step (Events a) -> Events a
+switch (Const x) = x
+switch (Step env m) = E env $ once $
+  do (t,n) <- m
+     i <- readTRef t
+     im <- getE i
+     runEmits env $ switchE im n
+
+
+justUp :: Step (Maybe a) -> Events a
+justUp (Const x) = never
+justUp (Step env m) = E env $ once $
+        do (t,n) <- m
+           runEmits env (justUpE t n) 
+
+justDown :: Step (Maybe a) -> Events a
+justDown (Const x) = never
+justDown  (Step env m) = E env $  once $
+        do (t,n) <- m
+           runEmits env (justDownE t n) 
+
+scanS :: (b -> a -> b) -> b -> Events a -> Step b
+scanS f i Never = Const i
+scanS f i (E env m) = Step env $ once $ 
+  do n <- m
+     mfix $ \p -> 
+      do n' <- runEmits env (scanlE f (fst p) n)  
+         t <- newTRef i n'
+         return (t,n')
+
+
 
 
 runFRP :: Now () -> IO (IO ())
 runFRP n = do sr <- newIORef []
               eenv <- newEnv
               let env = NowEnv sr eenv
-              runNow env n
+              runObsMDirect eenv $ runNow env n
               return (iteration eenv)
 
-justUp :: Step (Maybe a) -> Events a
-justUp (Step b (E env m)) = 
-  E env $ once $
-        do n <- m
-           runEmits env (justUpE b n) 
-
-justDown :: Step (Maybe a) -> Events a
-justDown (Step b (E env m)) = 
-  E env $ once $
-        do n <- m
-           runEmits env (justUpE b n) 
-
-joinStepE ::  Step (Step a) -> Events a
-joinStepE (Step b Never) = E env $ once $
-   do Step _ e <- runB b
-      case e of
-         Never -> return $ newBaseE e
-joinStepE (Step b (E env em)) = E env $ once $
-  do n <- em
-     
-
-
-data Step a = Step {initStep :: Behavior a, restStep :: Events a }
-
-instance Functor Step where
-  fmap f (Step b e) = 
-    let e' = fmap f e
-    in Step (unsafeStep (fmap f b) e') e'
-
-instance Applicative Step where
-  pure x = Step (pure x) never
-  (Step fb fe) <*> (Step xb xe) = 
-    let e = unsafeAppStep fb fe xb xe
-    in Step (unsafeStep (fb <*> xb) e) e
 
 
 
-      
 -- Emits implementations
 
 fmapE :: (x -> y) -> ENode x -> Emits y
 fmapE f e = loop where
- loop = Await (e :. X) $ \(Just x :. X) ->
-      pure $ Commit (Just (f x)) loop
+ loop = Await [Ex e] $
+      do v <- checkNode e
+         pure $ Commit (fmap f v) loop
 
 filterJustE :: ENode (Maybe a) -> Emits a
 filterJustE e = loop where
-  loop = Await (e :. X) $ \(x :. X) ->
-          pure $ Commit (join x) loop
+  loop = Await [Ex e] $
+      do v <- checkNode e
+         pure $ Commit (join v) loop
 
 unionWithE :: (a -> a -> a) -> ENode a -> ENode a -> Emits a 
 unionWithE f l r = loop where
- loop = Await (l :. r :. X) $ \(lv :. rv :. X) ->
-         pure (Commit (Just $ combine lv rv) loop)
+ loop = Await [Ex l, Ex r] $
+      do lv <- checkNode l
+         rv <- checkNode r
+         pure $ Commit (Just $ combine lv rv) loop
  combine (Just x) (Just y) = f x y
  combine Nothing  (Just y) = y
  combine (Just x) Nothing  = x
 
 observeE :: ENode (Behavior a) -> Emits a
 observeE e = loop where
- loop = Await (e :. X) $ \(Just xm :. X) ->
-         do x <- runB xm
-            pure $ Commit (Just x) loop
+ loop = Await [Ex e] $
+      do Just v <- checkNode e
+         x <- runB v
+         pure $ Commit (Just x) loop
 
-switchE :: ENode a -> ENode (Events a) -> Emits a 
-switchE b e = go b where
- go i = Await (i :. e :. X) $ \(iv :. ev :. X) ->
-       case ev of
-         Just (E _ m) ->
-          do i' <- m
-             pure $  WaitMore $ Await (i' :. e :. X) $ \(iv' :. _ :. X) ->
-                            pure $ Commit iv' (go i')
-         Nothing -> pure $ Commit iv (go i)
 
-joinStepE :: ENode a -> ENode (Step a) -> Emits a 
-joinStepE b e = go b where
- go i = Await (i :. e :. X) $ \(iv :. ev :. X) ->
-       case ev of
-         Just (Step ib (E _ m)) ->
-          do i' <- m
-             pure $  WaitMore $ Await (i' :. e :. X) $ \(iv' :. _ :. X) ->
-                            do v <- case iv' of
-                                 Nothing -> runB ib  
-                                 Just v -> return v
-                               return $ Commit (Just v) (go i')
-         Nothing -> pure $ Commit iv (go i)
 
-appStep :: Behavior (a -> b) -> ENode (a -> b) -> Behavior a -> ENode a -> Emits b 
-appStep bf ef bx ex = loop where
- loop = Await (ef :. ex :. X) $ \(fv :. xv :. X) ->
-     do v <- case (fv,xv) of
-            (Just f, Just x) -> pure (f x)
-            (Just f, Nothing) -> 
-              do x <- runB bx
-                 return (f x)
-            (Nothing, Just x) ->
-              do f <- runB bf
-                 return (f x)            
-        return $ Commit (Just v) loop 
-      
-justUpE :: Behavior (Maybe a) -> ENode (Maybe a) -> Emits a
-justUpE b e = loop where
-  loop = Await (e :. X) $ \(Just x :. X) ->
-        do p <- runB b
-           return $ Commit (combine p x) loop
-  combine Nothing r@(Just _) = r
-  cobmine _       _          = Nothing
 
-justDownE :: Behavior (Maybe a) -> ENode (Maybe a) -> Emits a
-justDownE b e = loop where
-  loop = Await (e :. X) $ \(Just x :. X) ->
-        do p <- runB b
-           return $ Commit (combine p x) loop
-  combine l@(Just _) Nothing = l
-  cobmine _       _          = Nothing
-          
+switchE :: Maybe (ENode a) -> ENode (Events a) -> Emits a 
+switchE b e = loop b where
+ loop Nothing = Await [Ex e] $
+                do Just i <- checkNode e
+                   handleNew i
+ loop (Just i) = Await [Ex e, Ex i] $
+     do ev <- checkNode e
+        case ev of
+          Just e -> handleNew e
+          Nothing -> do c <- checkNode i
+                        pure $ Commit c (loop (Just i))
+ handleNew i = case i of
+                Never -> pure $ Commit Nothing (loop Nothing)
+                E _ m -> do n <- liftIO m
+                            v <- checkNode n
+                            pure $ Commit v (loop (Just n))
+
+
+joinStepE :: Maybe (ENode a) -> ENode (Step a) -> Emits a 
+joinStepE b e = loop b where
+ loop Nothing = Await [Ex e] $
+                do Just i <- checkNode e
+                   handleNew i
+ loop (Just i) = Await [Ex e, Ex i] $
+     do ev <- checkNode e
+        case ev of
+          Just e -> handleNew e
+          Nothing -> do c <- checkNode i
+                        pure $ Commit c (loop (Just i))
+ handleNew i = case i of
+                Const x -> pure $ Commit (Just x) (loop Nothing)
+                Step _ m ->
+                    do (t,n) <- liftIO m
+                       v <- checkNode n
+                       i <- case v of
+                           Just x -> pure x
+                           Nothing -> liftIO $ readTRef t
+                       pure $ Commit (Just i) (loop (Just n))
+
 
 planE :: NowEnv -> ENode (Now a) -> Emits a
 planE strongRefs e = loop where
- loop = Await (e :. X) $ \(Just xm :. X) ->
-         do x <- runNow strongRefs xm
-            pure $ Commit (Just x) loop
+ loop = Await [Ex e] $
+         do Just xm <- checkNode e
+            x <- runNow strongRefs xm
+            pure $ Commit (Just x) loop        
+
+
+appStep :: TRef (a -> b) -> ENode (a -> b) -> TRef a -> ENode a -> Emits b 
+appStep bf ef bx ex = loop where
+ loop = Await [Ex ef, Ex ex] $ 
+     do fm <- maybeGet bf ef
+        xm <- maybeGet bx ex
+        return $ Commit (Just (fm xm)) loop
+  where maybeGet bx ex =
+          do mx <- checkNode ex
+             case mx of
+               Just x  -> pure x 
+               Nothing -> liftIO $ readTRef bx
+
+justUpE :: TRef (Maybe a) -> ENode (Maybe a) -> Emits a
+justUpE b e = loop where
+  loop = Await [Ex e] $
+        do p <- liftIO $ readTRef b 
+           Just x <- checkNode e 
+           return $ Commit (combine p x) loop
+  combine Nothing r@(Just _) = r
+  combine _       _          = Nothing
+
+justDownE :: TRef (Maybe a) -> ENode (Maybe a) -> Emits a
+justDownE b e = loop where
+  loop = Await [Ex e] $
+        do p <- liftIO $ readTRef b 
+           Just x <- checkNode e 
+           return $ Commit (combine p x) loop
+  combine l@(Just _) Nothing = l
+  combine _       _          = Nothing
+
+scanlE :: (b -> a -> b) -> TRef b -> ENode a  -> Emits b
+scanlE f b e = loop where
+  loop = Await [Ex e] $
+        do p <- liftIO $ readTRef b 
+           Just x <- checkNode e 
+           return $ Commit (Just (f p x)) loop
+          
+

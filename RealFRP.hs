@@ -1,17 +1,19 @@
 {-# Language  GeneralizedNewtypeDeriving, GADTs #-} 
 
 
-module RealFRP(Events, Behavior, Now, BLike(..), never, filterJust, unionWith, observe,plan,switchEv,Step(..), switch, justUp,justDown, callback, runFRP) where
+module RealFRP(Events, Behavior, Now, BLike(..), 
+     never, filterJust, unionWith, observe,plan,switchEv,
+     Step(..), getPrev, getUpdates, switch, justUp,justDown,scanS, 
+     callback, runFRP) where
 
 import EventNetwork 
-import FList 
 import Once
 import Control.Monad
 import Control.Monad.Reader
 import Data.IORef
 import Data.Maybe 
 
-data Events   a = E Env (IO (ENode a))
+data Events   a = E Env (ENode a))
                 | Never
 newtype Behavior a = B { runB :: Obs a }  deriving (Functor, Applicative,Monad,MonadFix)
 type StrongRefs = IORef [Ex ENode]
@@ -192,7 +194,9 @@ scanS f i (E env m) = Step env $ once $
          t <- newTRef i n'
          return (t,n')
 
-
+instance Monad Step where
+  return = pure
+  m >>= f = joinStep (fmap f m)
 
 
 runFRP :: Now () -> IO (IO ())

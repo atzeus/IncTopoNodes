@@ -13,6 +13,7 @@ module IncTopoSort(
 import Data.Int
 import Data.Graph hiding (Node) 
 import Data.IORef
+import Ex
 import Data.List
 import Data.Maybe
 import Data.Tree hiding (Node)
@@ -63,10 +64,7 @@ heqNode (Node l) (Node r) = l == r
 
 newtype Node (f :: * -> *) a = Node (IORef TopoInfo) deriving Eq
 
-{-| An @Ex f@ is the GADT encoding of the type @exists a. f a@
--}
-data Ex f where
-  Ex :: f a -> Ex f
+
 
 data ExNode f where
   ExNode :: Node f a -> ExNode f

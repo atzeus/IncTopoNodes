@@ -14,13 +14,9 @@ import Control.Monad.Fix
 import System.IO.Unsafe
 
 data Env = Env {
-  uuid       :: Unique,
   queue      :: !(PrioQueue EState),
   endOfRound :: !(IORef [IO ()])
  }
-
-instance Eq Env where
-  l == r = uuid l == uuid r
 
 data EState a = EState {
   action     :: !(IO ()),
@@ -28,7 +24,7 @@ data EState a = EState {
   behav      :: ![Weak (IORef a)]
  }
 
-data ENode a = E { uid :: !(Unique), getNode ::  !(Node EState a) }
+type ENode = Node EState
 
 data ObsF a where
   IsNow :: ENode a -> ObsF (Maybe a)
@@ -47,6 +43,7 @@ instance MonadFix Obs where
        x <- f (unsafePerformIO $ readIORef r)
        liftIO $ writeIORef r x
        return x
+
 
 checkNode :: ENode a -> Obs (Maybe a)
 checkNode e = O (op $ IsNow e)
@@ -67,11 +64,11 @@ runObsM env n (O m) = loop m where
         IsNow e           -> checkNow e f
 
   checkNow :: ENode a -> (Maybe a -> ObsM ()) -> IO ()
-  checkNow ev@(E _ e) f =
+  checkNow e f =
     do x <- isBefore e n
        if x 
-       then readE ev >>= loop . f   
-       else do setAction n (checkNow ev f)
+       then readE e >>= loop . f   
+       else do setAction n (checkNow e f)
                ensureAfter n e
                insertPQ (queue env) n
 
@@ -82,7 +79,7 @@ runEmits :: Env -> Emits a -> IO (ENode a)
 runEmits env a = 
   do n <- newNode (EState (return ()) Nothing [])
      runEmitsNode env n a
-     return (E (uuid env) n)
+     return n
 
 runEmitsNode :: Env -> Node EState a ->  Emits a -> IO ()
 runEmitsNode env n a =
@@ -105,9 +102,9 @@ runEmitsNode env n a =
     do addEdges prev (waits a)
        setAction n (loop a)
 
-  addEdges p [] = mapM_ (\(Ex (E _ h)) -> removeEdge n h) p
-  addEdges [] c = mapM_ (\(Ex (E _ h)) -> addEdge    n h) c
-  addEdges (Ex (E _ hp) : tp) (Ex (E _ h) : t) 
+  addEdges p [] = mapM_ (\(Ex h) -> removeEdge n h) p
+  addEdges [] c = mapM_ (\(Ex h) -> addEdge    n h) c
+  addEdges (Ex hp : tp) (Ex h : t) 
      | hp `heqNode` h = addEdges tp t
      | otherwise = do removeEdge n hp
                       addEdge n h
@@ -126,8 +123,8 @@ addEndOfRound env end =
 
 setAction   n a = modifyNode' n (\x -> x {action = a})
 
-readE (E _ n) = curEmit <$> readNode n
-risNow (E _ n) = isJust . curEmit <$> readNode n
+readE n  = curEmit <$> readNode n
+risNow n = isJust . curEmit <$> readNode n
 
 
 
@@ -148,11 +145,17 @@ cleanE n  =
 
 newtype TRef a = TRef (IORef a)
 
-newTRef :: a -> ENode a -> IO (TRef a)
-newTRef a (E _ e) = 
+-- non-strict in node!
+newTRef :: Env -> a -> ENode a -> IO (TRef a)
+newTRef env a e = 
    do r <- newIORef a 
-      wr <- mkWeakIORef r (return ())
-      modifyNode' e (\s -> s {behav = wr : behav s})
+      addEndOfRound env $ do
+         wr <- mkWeakIORef r (return ())
+         modifyNode' e (\s -> s {behav = wr : behav s})
+         cv <- readE e
+         case cv of
+          Just x -> writeIORef r x
+          Nothing -> return ()
       return (TRef r)
 
 readTRef :: TRef a -> IO a
@@ -179,11 +182,11 @@ iteration env = do handleQueue env
                    endOfRounds env
 
 newEnv :: IO Env 
-newEnv = Env <$> newUnique <*> emptyPqueue <*> newIORef []
+newEnv = Env <$> emptyPqueue <*> newIORef []
 
 newBaseE :: Env -> IO (ENode a, a -> IO ())
 newBaseE env =
     do n <- newNode (EState (return ()) Nothing [])
-       return (E (uuid env) n, emit n) where
+       return (n, emit n) where
    emit n x = commit env n (Just x)
 

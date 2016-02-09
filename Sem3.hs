@@ -55,35 +55,23 @@ observeE (E l) = E $ map (\(t,B f) -> (t, f t)) l
 stepb :: a -> E a -> B (B a)
 stepb i e = B $ \t -> B $ indexAt i (forgetE e t)
 
+-- abstract data type, invariant:
+-- assure that: hasUpdates b e = (b >>= \x -> stepb x e) == pure b
+data Step a = Step (B a, E a)
+
+prev :: Step a -> B a
+prev (Step (b,e)) = b
+
+updates :: Step a -> E a
+updates (Step (b,e)) = e
 
 -- proof obligation to use this function:
--- switchEb b e
 -- assure that: hasUpdates b e = (b >>= \x -> step x e) == pure b
-unsafeSwitchE :: B (E a) -> E (E a) -> E a
-unsafeSwitchE (B i) (E e) = E $ switchEm (getE $ i 0) e 
-  where switchEm :: [(Time,a)] -> [(Time,E a)] -> [(Time,a)]
-        switchEm l [] = l 
-        switchEm ((et,ev) : te) s@((st,_) : _) 
-           | et < st = (et,ev) : switchEm te s
-        switchEm _ ((st,e) : ts) = switchEm (forgetE e st) ts
-
--- proof obligation to use this function:
--- unsafeStep b e
--- assure that: hasUpdates b e = (b >>= \x -> step x e) == pure b
-unsafeStep :: B a -> E a -> B a
-unsafeStep b (E l) = b
-
--- derived
-
--- proof obligation:
--- hasUpdates b e
-data Step a = Step { prev :: B a , updates :: E a } 
+unsafeStep :: B a -> E a -> Step a
+unsafeStep b e = Step (b,e)
 
 instance Functor Step where
-  fmap f (Step b e) = step (fmap f b) (fmap f e)
-
-step :: B a -> E a -> Step a
-step b e = Step (unsafeStep b e) e
+  fmap f (Step (b,e)) = unsafeStep (fmap f b) (fmap f e)
 
 data LR a b = L a
             | R b
@@ -94,11 +82,40 @@ unionLR l r = unionWith (\(L a) (R b) -> LR a b) (L <$> l) (R <$> r)
 
 instance Applicative Step where
   pure x = Step (pure x) never
-  (Step fb fe) <*> (Step xb xe) = step (fb <*> xb) ups where
+  (Step fb fe) <*> (Step xb xe) = unsafeStep (fb <*> xb) ups where
      ups = observeE $ get <$> unionLR fe xe
      get (L f)    = f <$> xb
      get (R x)    = ($ x) <$> fb
      get (LR f x) = pure (f x)
+
+joinStep :: Step (Step a) -> Step a
+joinStep (Step (b,E e)) = Step (b >>= prev) (
+  where switchEm :: [(Time,a)] -> [(Time,Step a)] -> [(Time,a)]
+        switchEm l [] = l 
+        switchEm ((et,ev) : te) s@((st,_) : _) 
+           | et < st = (et,ev) : switchEm te s
+        switchEm _ ((st,e) : ts) = switchEm (forgetE e st) ts
+
+
+switchE :: Step (E a) -> E a
+switchE (Step (b,E e)) = E (switchEm  
+  where switchEm :: [(Time,a)] -> [(Time,E a)] -> [(Time,a)]
+        switchEm l [] = l 
+        switchEm ((et,ev) : te) s@((st,_) : _) 
+           | et < st = (et,ev) : switchEm te s
+        switchEm _ ((st,e) : ts) = switchEm (forgetE e st) ts
+
+-- proof obligation to use this function:
+-- switchEb b e
+-- assure that: hasUpdates b e = (b >>= \x -> step x e) == pure b
+unsafeSwitchE :: B (E a) -> E (E a) -> E a
+unsafeSwitchE (B i) (E e) = E $ switchEm (getE $ i 0) e 
+
+
+
+
+
+
 
 
 switchS :: Step (E a) -> E a

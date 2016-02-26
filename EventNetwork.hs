@@ -1,9 +1,9 @@
 {-# Language Rank2Types,GeneralizedNewtypeDeriving,GADTs #-} 
 
-module EventNetwork(ENode, Emits(..), EmitState(..), newBaseE , runEmits, TRef, newTRef, readTRef, iteration, Env,newEnv, Ex(..), checkNode, Obs,runObsMDirect)  where
+module EventNetwork(ENode, Emits(..), EmitState(..), newBaseE , runEmits,runEmitsIndirect, addEndOfRound, TRef, newTRef, readTRef, poll, iteration, Env,newEnv, Ex(..), checkNode, Obs,runObsMDirect)  where
 import FList 
 import IncTopoSort
-import System.Mem.Weak
+import System.Mem.Weak 
 import Data.IORef
 import Data.Maybe
 import Data.Unique
@@ -17,6 +17,8 @@ data Env = Env {
   queue      :: !(PrioQueue EState),
   endOfRound :: !(IORef [IO ()])
  }
+
+
 
 data EState a = EState {
   action     :: !(IO ()),
@@ -72,20 +74,31 @@ runObsM env n (O m) = loop m where
                ensureAfter n e
                insertPQ (queue env) n
 
+
+
 data Emits a = Await { waits :: [Ex ENode], cont :: Obs (EmitState a) }
 data EmitState a = Commit (Maybe a) (Emits a)
 
 runEmits :: Env -> Emits a -> IO (ENode a)
 runEmits env a = 
   do n <- newNode (EState (return ()) Nothing [])
-     runEmitsNode env n a
+     runEmitsNode True env n a
      return n
 
-runEmitsNode :: Env -> Node EState a ->  Emits a -> IO ()
-runEmitsNode env n a =
-  do addEdges [] (waits a)
-     setAction n (loop a)
-     insertPQ (queue env) n where
+runEmitsIndirect :: Env -> Emits a -> IO (ENode a)
+runEmitsIndirect env a = 
+ do  n <- newNode (EState (return ()) Nothing [])
+     runEmitsNode False env n a
+     return n
+
+runEmitsNode :: Bool -> Env -> Node EState a ->  Emits a -> IO ()
+runEmitsNode b env n a =
+  if b 
+  then do addEdges [] (waits a)
+          setAction n (loop a)
+          insertPQ (queue env) n 
+  else setNext [] a where
+
 
   loop (Await [] _) = return ()
   loop (Await lis co) = 
@@ -102,6 +115,7 @@ runEmitsNode env n a =
     do addEdges prev (waits a)
        setAction n (loop a)
 
+  addEdges [] [] = return ()
   addEdges p [] = mapM_ (\(Ex h) -> removeEdge n h) p
   addEdges [] c = mapM_ (\(Ex h) -> addEdge    n h) c
   addEdges (Ex hp : tp) (Ex h : t) 
@@ -112,7 +126,8 @@ runEmitsNode env n a =
 
 commit env n v = do setEmit n v
                     addClean n
-                    scheduleParents (queue env) n where
+                    scheduleParents (queue env) n
+                     where
 
   setEmit n a = modifyNode' n (\x -> x {curEmit = a})
   addClean  n = modifyIORef' (endOfRound env) (cleanE n :)
@@ -125,8 +140,6 @@ setAction   n a = modifyNode' n (\x -> x {action = a})
 
 readE n  = curEmit <$> readNode n
 risNow n = isJust . curEmit <$> readNode n
-
-
 
 cleanE n  =
  do es <- readNode n    
@@ -142,6 +155,19 @@ cleanE n  =
       let b' = catMaybes $ zipWith (\x y -> x <$ y) (behav es) bm
       writeNode n (es {behav = b' } )
 
+-- executed 0 or once per iteration
+poll :: Env -> IO a -> IO (IO a)
+poll env m =  
+  do r <- newIORef Nothing
+     return (update r) where
+  update r =
+    do v <- readIORef r
+       case v of 
+         Just x -> return x
+         Nothing -> do v <- m
+                       writeIORef r (Just v)
+                       addEndOfRound env (writeIORef r Nothing)
+                       return v
 
 newtype TRef a = TRef (IORef a)
 
@@ -164,11 +190,13 @@ readTRef (TRef r) = readIORef r
 
 handleQueue :: Env -> IO ()
 handleQueue env = 
-  do h <- dequeue (queue env)
+  do n <- sizeQueue (queue env)
+     h <- dequeue (queue env)
      case h of
        Just (ExNode m) -> 
            do a <- action <$> readNode m  
               a 
+              handleQueue env
        Nothing -> return ()
 
 endOfRounds :: Env -> IO ()

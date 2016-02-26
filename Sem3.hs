@@ -29,6 +29,20 @@ indexAt i _ _ = i
 never :: E a
 never = E []
 
+scanb :: (a →  b →  b) → b → Events a → Behavior b
+scanb f i []            = \t -> i
+scanb f i ((tv,v) : tt) = \t -> 
+     if t <= tv then i else scanb f (f v i) tt t
+
+scanb :: (a →  b →  b) → b → Events a → Behavior (Behavior b)
+scanb f i e = \tstart -> go i estart where
+     estart = [(t,v) | (t,v) <- e, t > tstart ]
+     go :: b -> Events a -> Behavior b
+     go i []           = \t -> i
+     go i ((t,v) : tt)
+         | 
+
+
 unionWith :: (a -> a -> a) -> E a -> E a -> E a
 unionWith f (E l) (E r) = E $ go l r where
   go l r = 
@@ -39,7 +53,14 @@ unionWith f (E l) (E r) = E $ go l r where
        | lt < rt  -> (lt, lv)      : go tl r
        | lt == rt -> (lt, f lv rv) : go tl tr
        | lt > rt  -> (rt, rv)      : go l  tr
-       
+
+unionWith :: (a -> a -> a) -> Events a -> Events a -> Events a
+unionWith f [] r = r
+unionWith f l [] = l
+unionWith f l@((tl,vl) : lt) r@((tr,vr) : rt) 
+      | tl <  tr  = (tl,vl)       : unionWith f lt r
+      | tl == tr  = (tl, f vl vr) : unionWith f lt rt
+      | tl >  tr  = (tr,vr)       : unionWith f l  rt
 
 filterJust :: E (Maybe a) -> E a
 filterJust (E l) = E $ catMaybes $ map (\(t,m) -> fmap (t,) m) l

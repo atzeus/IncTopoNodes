@@ -8,22 +8,24 @@ module IncTopoSort(
      -- * Ordering operations
       Ex(..), ExNode(..), Level,  getLevel, isBefore,  addEdge, removeEdge, getParents, ensureLevel, removeIngoingEdges, ensureAfter,
      -- * Priority queue
-     PrioQueue,isEmptyPqueue, emptyPqueue, insertPQ, scheduleParents, dequeue) where
+     PrioQueue,isEmptyPqueue, emptyPqueue, sizeQueue, insertPQ, scheduleParents, dequeue) where
 
 import Data.Int
 import Data.Graph hiding (Node) 
-import Data.IORef
+import Data.IORef hiding (mkWeakIORef)
 import Ex
 import Data.List
 import Data.Maybe
 import Data.Tree hiding (Node)
-import System.Mem.Weak
+--import System.Mem.Weak
 import GHC.Prim
 import Test.QuickCheck
 import Test.QuickCheck.Monadic
 import Unsafe.Coerce
 import Control.Monad.Trans
+import Data.Unique
 import qualified Data.PQueue.Prio.Min as IM
+import System.IO.Unsafe
 
 
 {-$intro
@@ -40,10 +42,15 @@ For efficiency, each node also functions as a mutable cell.
 -}
 
 
+data Weak a = Weak a
+
+deRefWeak (Weak a) = pure $ Just a
+
 data TopoInfo = TopoNode {
    parents :: ![Weak (IORef TopoInfo)],
    info    :: !Any,
-   level   :: {-# UNPACK #-} !Level }
+   level   :: {-# UNPACK #-} !Level,
+   uuid    :: Unique}
   | BlackHole
 
 
@@ -69,11 +76,13 @@ newtype Node (f :: * -> *) a = Node (IORef TopoInfo) deriving Eq
 data ExNode f where
   ExNode :: Node f a -> ExNode f
 
-
+mkWeakIORef :: IORef a -> IO () -> IO (Weak (IORef a))
+mkWeakIORef r _ = return (Weak r)
 
 
 newNode ::  f a -> IO (Node f a)
-newNode a = do r <- newIORef (TopoNode [] (unsafeCoerce# a) minBound)
+newNode a = do u <- newUnique 
+               r <- newIORef (TopoNode [] (unsafeCoerce# a) minBound u)
                return (Node r)
 
 readNode :: Node f a -> IO (f a)
@@ -95,6 +104,10 @@ modifyNode' n f = do x <- readNode n
                      let y = f x
                      y `seq` writeNode n y
 
+instance Show (Node f a) where
+  show (Node n) = unsafePerformIO $ show . hashUnique. uuid <$> readIORef n 
+
+
 {-| @addEdge from to@ creates an edge from @from@ to @to@. Returns @False@ if the edge could not be added because this edge would cause a loop. In case the edge already exists, nothing is done.
 -}
 addEdge :: Node f a -> Node f b -> IO Bool
@@ -103,7 +116,7 @@ addEdge from@(Node fr) to@(Node tor) =
          if notLoop 
          then do toInfo  <- readIORef tor
                  wTo  <- mkWeakIORef tor (return ())  
-                 fref <- mkWeakIORef fr (removeEdgeWeak from wTo)
+                 fref <- mkWeakIORef fr (return ())-- (removeEdgeWeak from wTo)
                  writeIORef tor (toInfo {parents = fref : parents toInfo} )
          else return ()
          return notLoop
@@ -169,7 +182,8 @@ removeIngoingEdges (Node to) =
 -}
 removeEdge :: Node f a -> Node f b -> IO ()
 removeEdge (Node from) (Node to) = 
-  do toInfo <- readIORef to
+  do --putStrLn ("remove from " ++ (show (Node from)) ++ "to " ++ show (Node to))
+     toInfo <- readIORef to
      parents' <- loop (parents toInfo) 
      writeIORef to (toInfo {parents = parents'} ) where
   loop [] = return []
@@ -184,7 +198,8 @@ removeEdge (Node from) (Node to) =
 getParents :: Node f a -> IO [ExNode f]
 getParents (Node n) = 
      do pr <- parents <$> readIORef n
-        map (ExNode . Node) . catMaybes <$> mapM deRefWeak pr
+        l <- map (ExNode . Node) . catMaybes <$> mapM deRefWeak pr
+        return l
 
 {-| A priority queue which gives nodes in order of the partial order defined by the dag. The priority queue containing 'ExNode' elements of type @ExNode f@. Note that the order of
     the elements is always corresponds with the dag from which the nodes originate, even when their order changes after inserting them.
@@ -197,6 +212,9 @@ emptyPqueue = PQ <$> newIORef IM.empty
 
 isEmptyPqueue :: PrioQueue f -> IO Bool
 isEmptyPqueue (PQ q) = null <$> readIORef q
+
+sizeQueue :: PrioQueue f -> IO Int
+sizeQueue (PQ q) = IM.size  <$> readIORef q
 
 scheduleParents :: PrioQueue f -> Node f x ->  IO ()
 scheduleParents pq n = 

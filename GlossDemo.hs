@@ -1,4 +1,4 @@
-{-# Language OverloadedStrings,RecursiveDo #-}
+{-# Language RecursiveDo #-}
 import Graphics.Gloss
 import Graphics.Gloss.Interface.IO.Game
 import GlossFRP
@@ -105,26 +105,7 @@ ball c (Cirkel (x,y) r) = Translate x y $ Color c $ circleSolid r
 
 
 
--- type Point = (Float,Float)
 
-
-
-
-type Vec = (Float,Float)
-(.+) :: Vec -> Vec -> Vec
-(x,y) .+ (x',y') = (x + x', y + y')
-
-(.*.) :: Vec -> Vec -> Vec
-(x,y) .*. (x',y') = (x * x', y * y')
-
-(.-) :: Vec -> Vec -> Vec
-(x,y) .- (x',y') = (x - x', y - y')
-
-(.*) :: Float -> Vec -> Vec
-t .* (x,y) = (t * x, t * y)
-
-(./) :: Vec -> Float -> Vec
-(x,y) ./ t = (x / t, y / t)
 
 
 {-
